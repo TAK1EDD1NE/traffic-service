@@ -40,14 +40,19 @@ def advisory_lock(conn, key: str):
 
 @contextlib.contextmanager
 def job_run(conn, job: str, target: str | None = None):
-    record: dict = {"metrics": None}
+    record: dict = {}
     ok = True
     error: str | None = None
     try:
         yield record
     except BaseException as exc:  # noqa: BLE001 — record, then re-raise unchanged
-        ok = False
-        error = f"{type(exc).__name__}: {exc}"[:2000]
+        if isinstance(exc, JobLocked):
+            # Another run holds this job's lock: the work is happening, just not
+            # here. Not a failure — alerting reads `ok`.
+            record.setdefault("metrics", {"skipped": "locked"})
+        else:
+            ok = False
+            error = f"{type(exc).__name__}: {exc}"[:2000]
         raise
     finally:
         # The audit row must survive the caller's failure, so it is written on a
