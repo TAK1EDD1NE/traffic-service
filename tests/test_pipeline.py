@@ -21,8 +21,18 @@ def test_load_imports_the_scraper_from_that_directory():
         assert hasattr(scraper, attribute), attribute
 
 
-def test_load_imports_the_extraction_pipeline():
-    assert hasattr(pipeline.load("run_traffic_local"), "process_one_image")
+def test_the_extraction_module_is_where_the_shim_looks():
+    """`run_traffic_local` is imported by the night pipeline, and its dependency set
+    (opencv / scikit-image / scipy) belongs to the worker's `pipeline` extra — the
+    real import is asserted there, not here. What belongs here is that the shim
+    can find the file at all."""
+    assert (pipeline.DATA_ENGINEERING / "run_traffic_local.py").is_file()
+
+
+def test_an_unknown_module_raises_pipeline_not_found():
+    with pytest.raises(pipeline.PipelineNotFound) as excinfo:
+        pipeline.load("no_such_pipeline_module")
+    assert "no_such_pipeline_module.py" in str(excinfo.value)
 
 
 def test_a_missing_module_names_the_file(monkeypatch):
