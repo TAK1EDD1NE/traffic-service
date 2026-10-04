@@ -51,7 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--raw-root", default=str(DEFAULT_RAW_ROOT))
     capture.add_argument("--limit", type=int, default=None, help="capture only the first N zones")
     capture.add_argument("--force", action="store_true")
-    sub.add_parser("scheduler", help="run the 12-per-day capture schedule until interrupted")
+    sched = sub.add_parser("scheduler", help="run the 12-per-day capture schedule until interrupted")
+    sched.add_argument("--raw-root", default=str(DEFAULT_RAW_ROOT))
     return parser
 
 

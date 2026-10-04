@@ -65,6 +65,13 @@ def test_an_unparseable_slot_is_rejected():
         cli.parse_slot("not-a-timestamp")
 
 
+def test_the_scheduler_command_declares_the_raw_root_it_reads():
+    """cmd_scheduler reads args.raw_root; if the subparser does not define it the
+    command dies with AttributeError before starting."""
+    args = cli.build_parser().parse_args(["scheduler"])
+    assert args.raw_root, "the scheduler subparser must declare --raw-root"
+
+
 def test_doctor_reports_the_last_slot(db, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "resolve_capturer", lambda: _fake_capturer)
     cli.main(["capture", "--slot", "2026-10-05T08:00", "--raw-root", str(tmp_path)])
