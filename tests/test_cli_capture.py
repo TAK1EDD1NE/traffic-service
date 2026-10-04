@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from traffic_service import cli
@@ -80,3 +82,13 @@ def test_doctor_reports_the_last_slot(db, tmp_path, monkeypatch, capsys):
     # plan 1); this fixture holds one zone, so only the report line is asserted here.
     cli.main(["doctor"])
     assert "last slot: 2026-10-05T08-00 ok" in capsys.readouterr().out
+
+
+def test_main_configures_logging_at_info(db, capsys):
+    """Nothing else calls basicConfig, so the root logger would sit at WARNING and
+    every progress `logging.info` would be dropped — an unattended service whose
+    failure mode is 'quietly captured nothing' must not be silent. Drop the level
+    first so the assertion proves `main()` raised it, not an earlier test."""
+    logging.getLogger().setLevel(logging.WARNING)
+    cli.main(["doctor"])
+    assert logging.getLogger().level == logging.INFO

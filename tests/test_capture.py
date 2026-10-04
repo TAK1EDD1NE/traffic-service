@@ -158,3 +158,34 @@ def test_an_empty_registry_raises(db, tmp_path):
     db.commit()
     with pytest.raises(RuntimeError, match="no zones"):
         capture_slot(db, SLOT, raw_root=tmp_path, capturer=_ok)
+
+
+def test_an_interrupted_slot_commits_per_zone_and_resumes(db, tmp_path):
+    """A crash mid-slot must not discard the zones already captured: each zone's
+    row is committed as it lands, so the next run resumes instead of redoing all
+    of them. `SystemExit` is deliberately not caught by capture_slot's
+    `except Exception`, which is how a power cut is simulated here."""
+    calls = []
+
+    def crashes_after_the_first_zone(zone, dest):
+        calls.append(zone["zone_id"])
+        if len(calls) > 1:
+            raise SystemExit("power cut")
+        _ok(zone, dest)
+
+    with pytest.raises(SystemExit):
+        capture_slot(db, SLOT, raw_root=tmp_path, capturer=crashes_after_the_first_zone)
+
+    # Read on a *fresh* connection: the row must be durable, not merely visible in
+    # the crashed connection's still-open transaction. The `slots` row exists
+    # because the captures FK requires it, but it is still 'running' — the slot
+    # never finished — which is what makes an interrupted slot recognisable.
+    with connect() as other:
+        with other.cursor() as cur:
+            cur.execute("select count(*), count(path) from captures")
+            assert cur.fetchone() == (1, 1), "the first zone's row must be durable"
+            cur.execute("select status from slots")
+            assert cur.fetchone() == ("running",), "an interrupted slot is left unfinished"
+
+    result = capture_slot(db, SLOT, raw_root=tmp_path, capturer=_ok)
+    assert (result["captured"], result["skipped"]) == (2, 1)

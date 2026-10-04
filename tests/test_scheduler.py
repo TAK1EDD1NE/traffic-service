@@ -5,7 +5,7 @@ import pytest
 
 from traffic_service.db import connect
 from traffic_service.migrate import migrate
-from traffic_service.scheduler import build, run_slot, slot_hours
+from traffic_service.scheduler import build, catch_up, run_slot, slot_hours
 
 ALGIERS = ZoneInfo("Africa/Algiers")
 
@@ -75,3 +75,67 @@ def test_run_slot_records_a_job_run_row(db, tmp_path):
     with db.cursor() as cur:
         cur.execute("select job, target, ok from job_runs")
         assert cur.fetchone() == ("capture", "2026-10-05T06-00", True)
+
+
+def test_the_scheduler_runs_its_jobs_on_a_single_worker():
+    """One worker so the 12 jobs run sequentially in-process (spec:82) and a later
+    job waits on the earlier slot's lock (spec:103) instead of starting a second
+    concurrent Chromium burst on the 2 vCPU box. `max_instances=1` limits each job
+    to itself, not the set, so the executor width is the real guard."""
+    scheduler = build(raw_root="unused")
+    scheduler.start(paused=True)  # materialise the executor without firing a job
+    try:
+        executor = scheduler._executors["default"]
+        assert executor._pool._max_workers == 1
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+def test_catch_up_captures_a_slot_that_has_no_row(db, tmp_path):
+    result = catch_up(tmp_path, capturer=_ok, now=datetime(2026, 10, 5, 10, 30, tzinfo=ALGIERS))
+    assert result is not None and result["status"] == "ok"
+    assert (tmp_path / "2026-10-05T10-00" / "Alger_1_2026-10-05_10-00.png").is_file()
+
+
+def test_catch_up_does_nothing_when_the_slot_has_already_finished(db, tmp_path):
+    with db.cursor() as cur:
+        cur.execute("insert into slots (slot_ts, expected, status) "
+                    "values ('2026-10-05 12:00+01', 1, 'ok')")
+    db.commit()
+    assert catch_up(tmp_path, capturer=_ok, now=datetime(2026, 10, 5, 12, 30, tzinfo=ALGIERS)) is None
+    with db.cursor() as cur:
+        cur.execute("select count(*) from captures")
+        assert cur.fetchone()[0] == 0, "a finished slot must not be re-captured"
+
+
+def test_catch_up_resumes_a_slot_whose_zones_were_partly_captured(db, tmp_path):
+    """A restart mid-slot leaves the finished zones' rows committed and the slot
+    still 'running'; catch-up must resume it rather than redo the whole slot."""
+    with db.cursor() as cur:
+        for area in (2, 3):
+            cur.execute(
+                """insert into zones (zone_id, city, city_slug, area_no, name, lat, lng, scale, publish)
+                   values (%s,'Alger','Alger',%s,'Alger',36.7,3.1,15.25,true)""",
+                (f"Alger_{area}", area))
+    db.commit()
+
+    calls = []
+
+    def crashes_after_the_first_zone(zone, dest):
+        calls.append(zone["zone_id"])
+        if len(calls) > 1:
+            raise SystemExit("power cut")
+        _ok(zone, dest)
+
+    now = datetime(2026, 10, 5, 14, 30, tzinfo=ALGIERS)
+    with pytest.raises(SystemExit):
+        catch_up(tmp_path, capturer=crashes_after_the_first_zone, now=now)
+
+    with db.cursor() as cur:
+        cur.execute("select count(*), count(path) from captures")
+        assert cur.fetchone() == (1, 1), "the first zone's row must be durable"
+        cur.execute("select status from slots")
+        assert cur.fetchone() == ("running",), "an interrupted slot is left unfinished"
+
+    result = catch_up(tmp_path, capturer=_ok, now=now)
+    assert (result["captured"], result["skipped"]) == (2, 1)

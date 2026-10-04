@@ -105,13 +105,17 @@ def capture_slot(conn, slot_ts, *, raw_root, capturer, zones=None,
                 cur.execute(UPSERT_CAPTURE, (zone_id, slot_ts,
                                              str(dest) if error is None else None,
                                              size, error))
+            # Commit per zone: a crash mid-slot must not discard the zones already
+            # captured, or the next run redoes all 95 (~14 min). The `slots` row is
+            # written up front (the `captures` foreign key needs it) and only
+            # finished at the end, so an interrupted slot is left `running`.
+            conn.commit()
             if error is None:
                 captured += 1
             else:
                 failed += 1
                 logging.warning("capture failed for %s in slot %s: %s",
                                 zone_id, slot_key(slot_ts), error)
-        conn.commit()
 
         status = _status(captured + skipped, expected)
         with conn.cursor() as cur:

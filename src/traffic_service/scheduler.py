@@ -37,11 +37,38 @@ def run_slot(raw_root, capturer=None, now: datetime | None = None) -> dict | Non
         return None
 
 
+def catch_up(raw_root, capturer=None, now: datetime | None = None) -> dict | None:
+    """Re-run the current slot if a restart interrupted it.
+
+    The `slots` row is written up front (the `captures` foreign key needs it) and
+    only finished at the end, so an interrupted slot is left `running`. A restart
+    that merely computes the *next* fire time would never retry it, making the
+    missed slot a total hole. Capture the current slot unless it has already
+    finished; the advisory lock makes this safe against a concurrent run.
+    """
+    moment = now or datetime.now(SLOT_TZ)
+    slot_ts = slot_for(moment)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select 1 from slots where slot_ts = %s and status <> 'running'",
+                        (slot_ts,))
+            if cur.fetchone() is not None:
+                return None
+    return run_slot(raw_root, capturer=capturer, now=moment)
+
+
 def build(raw_root, capturer=None, now=None):
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 
-    scheduler = BackgroundScheduler(timezone=SLOT_TZ)
+    scheduler = BackgroundScheduler(
+        timezone=SLOT_TZ,
+        # One worker: the spec says the jobs run sequentially in-process and a
+        # later job waits on the earlier slot's advisory lock (spec:82, spec:103).
+        # The default 10-wide thread pool plus a *per-slot* lock would let a slot
+        # that overran its 2 h window start a second concurrent Chromium burst.
+        executors={"default": {"type": "threadpool", "max_workers": 1}},
+    )
     for hour, minute in slot_hours():
         scheduler.add_job(
             run_slot,

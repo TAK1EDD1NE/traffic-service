@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import pathlib
 import sys
 import time
@@ -15,6 +16,11 @@ from traffic_service.slots import SLOT_TZ, slot_for, slot_key
 
 DATA_ENGINEERING = pathlib.Path(__file__).resolve().parents[3] / "data engineering"
 DEFAULT_RAW_ROOT = pathlib.Path("/data/raw")
+
+
+def configure_logging(level=logging.INFO):
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger().setLevel(level)   # explicit, so it is observable and testable
 
 
 def resolve_capturer():
@@ -89,9 +95,11 @@ def cmd_capture(args) -> int:
 
 
 def cmd_scheduler(args) -> int:
-    from traffic_service.scheduler import build, slot_hours
+    from traffic_service.scheduler import build, catch_up, slot_hours
 
-    scheduler = build(args.raw_root, capturer=resolve_capturer())
+    capturer = resolve_capturer()
+    catch_up(args.raw_root, capturer=capturer)
+    scheduler = build(args.raw_root, capturer=capturer)
     scheduler.start()
     print("scheduler started; capture at " +
           ", ".join(f"{hour:02d}:00" for hour, _ in slot_hours()) + " Africa/Algiers")
@@ -130,6 +138,7 @@ COMMANDS = {"migrate": cmd_migrate, "doctor": cmd_doctor, "seed-zones": cmd_seed
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_logging()
     args = build_parser().parse_args(argv)
     return COMMANDS[args.command](args)
 
