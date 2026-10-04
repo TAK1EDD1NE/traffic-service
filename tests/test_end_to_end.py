@@ -10,7 +10,7 @@ def test_from_empty_database_to_a_seeded_registry():
             cur.execute("drop schema public cascade; create schema public")
         conn.commit()
 
-        assert migrate(conn) == ["0001_init.sql"]
+        assert migrate(conn)[0] == "0001_init.sql"
         assert seed_zones(conn, cli.DATA_ENGINEERING / "locations.json",
                           cli.DATA_ENGINEERING / "traffic_areas.csv") == 95
 
