@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: traffic
+      POSTGRES_PASSWORD: traffic
+      POSTGRES_DB: traffic
+    ports:
+      # 5433 on purpose: 5432 is commonly taken on this machine, and a clash
+      # there would present as a code bug.
+      - "5433:5432"
+    volumes:
+      - traffic-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U traffic -d traffic"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  traffic-pgdata:
