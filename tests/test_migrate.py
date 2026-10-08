@@ -22,7 +22,7 @@ def clean_db():
 
 def test_migrate_creates_every_table(clean_db):
     applied = migrate(clean_db)
-    assert applied == ["0001_init.sql"]
+    assert applied[0] == "0001_init.sql", "later migrations must not invalidate this test"
     with clean_db.cursor() as cur:
         cur.execute(
             "select table_name from information_schema.tables where table_schema = 'public'"
@@ -34,6 +34,22 @@ def test_migrate_creates_every_table(clean_db):
 def test_migrate_is_idempotent(clean_db):
     migrate(clean_db)
     assert migrate(clean_db) == []
+
+
+def test_captures_path_is_nullable_so_a_failure_is_a_visible_row(clean_db):
+    migrate(clean_db)
+    with clean_db.cursor() as cur:
+        cur.execute("""insert into zones (zone_id, city, city_slug, area_no, name, lat, lng, scale)
+                       values ('Alger_1','Alger','Alger',1,'Alger',36.7,3.1,15.25)""")
+        cur.execute("insert into slots (slot_ts, expected) values ('2026-10-05 00:00+01', 95)")
+        cur.execute("""insert into captures (zone_id, slot_ts, path, error)
+                       values ('Alger_1', '2026-10-05 00:00+01', NULL,
+                               'CaptureAborted: no traffic layer')""")
+        cur.execute("select path, error from captures")
+        path, error = cur.fetchone()
+    assert path is None
+    assert "CaptureAborted" in error
+    clean_db.rollback()
 
 
 def test_measurements_is_keyed_by_zone_and_slot(clean_db):

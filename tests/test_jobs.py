@@ -62,3 +62,17 @@ def test_job_run_records_failure_and_reraises(db):
         ok, error = cur.fetchone()
     assert ok is False
     assert "11/12 slots" in error
+
+
+def test_job_run_records_a_lock_skip_as_not_failed(db):
+    """A skipped duplicate is healthy: another run is doing the work. Recording it
+    as ok=False would make plan 4's job_runs alerting cry wolf on every restart."""
+    with pytest.raises(JobLocked):
+        with job_run(db, "capture", target="2026-10-05T00:00"):
+            raise JobLocked("held elsewhere")
+    with db.cursor() as cur:
+        cur.execute("select ok, error, metrics from job_runs")
+        ok, error, metrics = cur.fetchone()
+    assert ok is True
+    assert error is None
+    assert metrics == {"skipped": "locked"}

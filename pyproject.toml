@@ -4,10 +4,13 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "psycopg[binary]>=3.2",
+    "apscheduler>=3.10,<4",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pandas>=2.2"]
+browser = ["playwright>=1.54"]
+pipeline = ["opencv-python>=4.10", "scikit-image>=0.24", "scipy>=1.13", "tqdm>=4.66"]
 
 [project.scripts]
 traffic-service = "traffic_service.cli:main"

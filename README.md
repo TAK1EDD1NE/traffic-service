@@ -50,3 +50,22 @@ own virtualenv.
         seed.py     corpus -> zones
         jobs.py     advisory lock + job_runs audit rows
         cli.py      the only entry point
+
+## Capturing
+
+    uv run traffic-service capture --slot now                 # the current slot
+    uv run traffic-service capture --slot 2026-10-05T02:00    # a specific slot (local)
+    uv run traffic-service capture --slot now --limit 5       # smoke test
+    uv run traffic-service scheduler                          # the 12-per-day loop
+
+- Slot timestamps are **local (Africa/Algiers)**, on even hours; the database
+  stores UTC.
+- A PNG is `<zone_id>_<local slot time>.png` under `<raw-root>/<slot>`, so a
+  re-run overwrites the same file and the slot is resumable.
+- A zone that failed gets a row with `path = NULL` and `error` set — visible, not
+  a hole — and is retried on the next run of that slot. `--force` re-captures
+  everything.
+- The slot holds an advisory lock; a second concurrent run is refused and
+  changes nothing.
+- `capture` exits **1** when a slot is not fully captured, so a scheduler wrapper
+  or an operator can see it.
