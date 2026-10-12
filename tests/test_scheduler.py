@@ -10,6 +10,17 @@ from traffic_service.scheduler import build, catch_up, run_slot, slot_hours
 ALGIERS = ZoneInfo("Africa/Algiers")
 
 
+def _fake_dump(cmd, **kwargs):
+    """A `pg_dump` that writes the `--file=` it was handed — the maintenance job dumps by default,
+    and no test may run a real `pg_dump` (R25)."""
+    import pathlib
+    import subprocess
+    for arg in cmd:
+        if str(arg).startswith("--file="):
+            pathlib.Path(str(arg).split("=", 1)[1]).write_bytes(b"select 1;\n")
+    return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+
 @pytest.fixture()
 def db():
     with connect() as conn:
@@ -94,9 +105,11 @@ def test_the_night_job_closes_the_local_day_before_now(db, tmp_path, monkeypatch
     assert captured["out_dir"] == tmp_path / "out"
 
 
-def test_the_maintenance_job_records_a_run_and_exits(db, tmp_path):
-    from traffic_service import scheduler
-    result = scheduler.run_maintenance_job(tmp_path, now=datetime(2026, 10, 5, 3, 30, tzinfo=ALGIERS))
+def test_the_maintenance_job_records_a_run_and_exits(db, tmp_path, monkeypatch):
+    from traffic_service import dump, scheduler
+    monkeypatch.setattr(dump.subprocess, "run", _fake_dump)
+    result = scheduler.run_maintenance_job(tmp_path, now=datetime(2026, 10, 5, 3, 30, tzinfo=ALGIERS),
+                                           dump_dir=tmp_path / "dump")
     assert result["vacuum"] == "measurements"
     with db.cursor() as cur:
         cur.execute("select job, ok from job_runs where job = 'maintenance'")

@@ -7,16 +7,30 @@ CLI's and `night.run_day`'s own wiring (the abort exit code, the `job_runs` row,
 successful publish) with no Chromium, no subprocess, and no wall-clock dependency.
 """
 import datetime as dt
+import pathlib
+import subprocess
 from datetime import datetime, timedelta
 
 import pytest
 
-from traffic_service import cli, night, prune, publish
+from traffic_service import cli, dump, night, prune, publish
 from traffic_service.db import connect
 from traffic_service.migrate import migrate
 from traffic_service.slots import SLOT_TZ, slot_for, slot_key
 
 DAY = dt.date(2026, 10, 4)
+
+
+def _fake_dump(cmd, **kwargs):
+    """A `pg_dump` that only writes the `--file=` it was handed.
+
+    `maintenance` dumps by default (plan 4 Task 1), so every maintenance test must keep a real
+    `pg_dump` from running (R25): the fake writes the plain file the real code then gzips.
+    """
+    for arg in cmd:
+        if str(arg).startswith("--file="):
+            pathlib.Path(str(arg).split("=", 1)[1]).write_bytes(b"select 1;\n")
+    return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
 
 @pytest.fixture()
@@ -219,8 +233,10 @@ def test_the_night_command_passes_the_workers_and_out_dir_it_was_given(tmp_path,
                         "out_dir": str(tmp_path / "site"), "workers": 2}
 
 
-def test_maintenance_exits_zero_and_records_its_job_run(db, tmp_path, capsys):
-    assert cli.main(["maintenance", "--raw-root", str(tmp_path)]) == 0
+def test_maintenance_exits_zero_and_records_its_job_run(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(dump.subprocess, "run", _fake_dump)
+    assert cli.main(["maintenance", "--raw-root", str(tmp_path),
+                     "--dump-dir", str(tmp_path / "dump")]) == 0
     out = capsys.readouterr().out
     assert "vacuum: measurements" in out
     with db.cursor() as cur:
@@ -231,15 +247,17 @@ def test_maintenance_exits_zero_and_records_its_job_run(db, tmp_path, capsys):
     assert metrics["prune"] == {"slots": 0, "bytes": 0}
 
 
-def test_maintenance_prunes_and_reports_a_recent_slot(db, tmp_path, capsys):
+def test_maintenance_prunes_and_reports_a_recent_slot(db, tmp_path, monkeypatch, capsys):
     raw = tmp_path / "raw"
     pruned = _an_old_slot_dir(raw)
+    monkeypatch.setattr(dump.subprocess, "run", _fake_dump)
     with db.cursor() as cur:
         cur.execute("insert into slots (slot_ts, expected, captured, status) "
                     "values (now(), 3, 3, 'ok')")
     db.commit()
 
-    assert cli.main(["maintenance", "--raw-root", str(raw)]) == 0
+    assert cli.main(["maintenance", "--raw-root", str(raw),
+                     "--dump-dir", str(tmp_path / "dump")]) == 0
     out = capsys.readouterr().out
     assert not pruned.exists()
     assert "slots (last 7 days): 1" in out
@@ -264,4 +282,6 @@ def test_the_night_and_maintenance_subparsers_declare_their_flags():
     assert (night_args.day, night_args.raw_root, night_args.out_dir,
             night_args.workers) == ("yesterday", str(cli.DEFAULT_RAW_ROOT),
                                     str(cli.DEFAULT_OUT_DIR), 4)
-    assert cli.build_parser().parse_args(["maintenance"]).raw_root == str(cli.DEFAULT_RAW_ROOT)
+    maint_args = cli.build_parser().parse_args(["maintenance"])
+    assert (maint_args.raw_root, maint_args.dump_dir,
+            maint_args.day) == (str(cli.DEFAULT_RAW_ROOT), str(cli.DEFAULT_DUMP_DIR), None)

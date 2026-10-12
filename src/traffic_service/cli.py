@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-from traffic_service import maintenance, night, publish
+from traffic_service import alerts, dump, maintenance, night, publish
 from traffic_service.capture import capture_slot_guarded, load_zones
 from traffic_service.db import connect
 from traffic_service.jobs import JobLocked
@@ -20,8 +20,10 @@ from traffic_service.slots import SLOT_TZ, slot_for, slot_key
 DATA_ENGINEERING = pathlib.Path(__file__).resolve().parents[3] / "data engineering"
 DEFAULT_RAW_ROOT = pathlib.Path("/data/raw")
 # The site's data directory — where `publish.publish_day` writes the nine CSVs and the manifest.
-# Plan 4 Task 1 adds `DEFAULT_DUMP_DIR` alongside this constant.
 DEFAULT_OUT_DIR = pathlib.Path("/data/out")
+# The nightly `pg_dump` directory. The default lives in `maintenance` (the scheduler cannot import
+# `cli`); this alias is the parser's default and the value Task 4's compose mount relies on.
+DEFAULT_DUMP_DIR = maintenance.DEFAULT_DUMP_DIR
 
 
 def configure_logging(level=logging.INFO):
@@ -72,8 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     night_parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR),
                               help="the site's data directory the publish writes")
     night_parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
-    maint = sub.add_parser("maintenance", help="prune raw PNGs and report slot health")
+    maint = sub.add_parser("maintenance", help="dump, prune raw PNGs, VACUUM and report slot health")
     maint.add_argument("--raw-root", default=str(DEFAULT_RAW_ROOT))
+    maint.add_argument("--dump-dir", default=str(DEFAULT_DUMP_DIR),
+                       help="where the nightly pg_dump is written")
+    maint.add_argument("--day", default=None,
+                       help="the job_runs target and dump file name, YYYY-MM-DD (default: today)")
     return parser
 
 
@@ -182,6 +188,7 @@ def cmd_night(args) -> int:
         with connect() as conn:
             summary = night.run_day(conn, day, args.raw_root, args.out_dir, workers=args.workers)
     except publish.PublishAborted as error:
+        alerts.notify(f"night {day} aborted: {error}")
         print(f"night {day} aborted: {error}", file=sys.stderr)
         return 1
     except JobLocked as error:
@@ -208,17 +215,42 @@ def cmd_night(args) -> int:
 
 
 def cmd_maintenance(args) -> int:
-    """Prune raw PNGs, VACUUM, and print the slot health summary `maintenance` returns."""
-    with connect() as conn:
-        summary = maintenance.run_maintenance(conn, args.raw_root)
+    """Dump, prune, VACUUM and print the health summary `maintenance.run_maintenance` returns.
+
+    The work — and the alerting — lives in `maintenance.run_maintenance` (R18/R21), so the 03:30
+    scheduled run and this command share one implementation; this is a parse → call → print →
+    exit-code wrapper and must not re-implement any of it. `--day` (an ISO date, default today) is
+    both the `job_runs` target and the dump's file name (R26); a failed `pg_dump` raises out of
+    the module and is exit 1.
+    """
+    now = datetime.now(SLOT_TZ)
+    if args.day:
+        try:
+            day = datetime.strptime(args.day, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise SystemExit(f"--day must be YYYY-MM-DD: {args.day!r}") from error
+    else:
+        day = None
+    try:
+        with connect() as conn:
+            summary = maintenance.run_maintenance(conn, args.raw_root, now=now,
+                                                  dump_dir=args.dump_dir, day=day)
+    except dump.DumpFailed as error:
+        print(f"maintenance failed: {error}", file=sys.stderr)
+        return 1
 
     pruned = summary["prune"]
     print(f"pruned: {pruned['slots']} slot(s), {pruned['bytes']} byte(s)")
     print(f"vacuum: {summary['vacuum']}")
+    print(f"dump: {summary.get('dump', 'skipped')}")
     print(f"slots (last {maintenance.HEALTH_WINDOW_DAYS} days): {len(summary['slots'])}")
     for slot in summary["slots"]:
         print(f"  {slot['slot']} {slot['status']} {slot['captured']}/{slot['expected']} "
               f"failed={slot['failed']}")
+    # The alertable problems are already sent by `run_maintenance`; they are echoed here so an
+    # operator reading the command's output sees the same list the alert channel got.
+    for problem in summary["problems"]:
+        print(f"warning: {problem}", file=sys.stderr)
     return 0
 
 

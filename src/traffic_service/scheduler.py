@@ -84,15 +84,19 @@ def run_night_job(raw_root, out_dir=None, now=None, workers=DEFAULT_WORKERS) -> 
         return None
 
 
-def run_maintenance_job(raw_root, now=None) -> dict | None:
-    """The 03:30 job: prune raw PNGs, VACUUM, and record the slot health summary.
+def run_maintenance_job(raw_root, now=None, dump_dir=None) -> dict | None:
+    """The 03:30 job: dump, prune raw PNGs, VACUUM, and record the slot health summary.
 
     Returns None when another run holds the maintenance lock. `now` is injectable so the job is
-    testable without a wall-clock dependency (the same rule the capture jobs follow).
+    testable without a wall-clock dependency (the same rule the capture jobs follow), and
+    `dump_dir` mirrors `run_night_job`'s `out_dir` so a caller can point the `pg_dump` at a temp
+    directory instead of the `/data/dump` default. The run's alerts go through
+    `maintenance.run_maintenance`'s default notifier (`alerts.notify`): the scheduled path is a
+    caller of the module, so the channel is injected there, not wired here (R24).
     """
     try:
         with connect() as conn:
-            return maintenance.run_maintenance(conn, raw_root, now=now)
+            return maintenance.run_maintenance(conn, raw_root, now=now, dump_dir=dump_dir)
     except JobLocked:
         logging.info("maintenance is already running elsewhere; skipping")
         return None

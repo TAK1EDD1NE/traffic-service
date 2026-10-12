@@ -1,13 +1,19 @@
 # traffic-service/src/traffic_service/maintenance.py
-"""The daily maintenance pass: prune the raw PNGs, VACUUM the measurements table, report health.
+"""The daily maintenance pass: dump, prune, VACUUM, and report health.
 
 This module owns the *data*, the CLI owns the *presentation*: `run_maintenance` returns its
 summary as plain structures and prints nothing, so plan 4's ops work (dump, disk checks, alerts)
-can extend it — and consume its result — without re-implementing or duplicating the formatting
-that lives in `cli.cmd_maintenance`. That split is the seam plan 4 Task 1 grows into.
+extends it — and consumes its result — without re-implementing or duplicating the formatting that
+lives in `cli.cmd_maintenance`. That split is the seam plan 4 Task 1 grows into (R18/R21): the
+03:30 scheduled run imports this module directly and must share one implementation with the
+`maintenance` command, so the alert channel is injected here, not wired in the CLI.
 
-Three jobs, in order:
+Four jobs, in order:
 
+- **dump** (`dump.pg_dump`) — a nightly `pg_dump` to `/data/dump` (keep 14), the file an operator
+  restores on a fresh VPS. **On by default**: a maintenance run that silently skipped the backup
+  is the failure this pass exists to prevent. A non-zero `pg_dump` raises `DumpFailed` out of
+  `run_maintenance`, so the `job_runs` row reads `ok = false` with the reason.
 - **prune** (`prune.prune_raw`) — the same retention rule the night job applies, run on its own so
   pixels are still cleaned up on a day whose publish aborted (the night job prunes only after a
   successful publish, which is correct for the publish path but leaves a failed day's pixels for
@@ -15,19 +21,27 @@ Three jobs, in order:
 - **vacuum** — `VACUUM (ANALYZE) measurements`, the table that grows every night. See the comment
   in `vacuum()`: VACUUM cannot run inside a transaction block, so it is issued on an autocommit
   connection.
-- **health** (`recent_slots`) — the last `HEALTH_WINDOW_DAYS` of slots with their status and capture
-  counts. This is the read plan 4's stale-`running`-slot alert will build on; it is computed here,
-  not alerted on.
+- **health** (`recent_slots` and `alerts.health`) — the last `HEALTH_WINDOW_DAYS` of slots as a
+  per-slot summary, plus the alertable problems (`alerts.health` — a missing/stale/short slot, a
+  failed night) and the disk check. An unhealthy-but-checked system is not a failed run: the
+  problems are recorded in `metrics` and sent to the notifier; only a failed `pg_dump` fails the
+  run.
 """
 from __future__ import annotations
 
-from datetime import datetime
+import pathlib
+from datetime import date, datetime
 
-from traffic_service import prune
+from traffic_service import alerts, db, dump, prune
 from traffic_service.jobs import advisory_lock, job_run
 from traffic_service.slots import SLOT_TZ
 
-__all__ = ["HEALTH_WINDOW_DAYS", "VACUUM_TABLE", "recent_slots", "run_maintenance", "vacuum"]
+__all__ = ["DEFAULT_DUMP_DIR", "HEALTH_WINDOW_DAYS", "VACUUM_TABLE", "recent_slots",
+           "run_maintenance", "vacuum"]
+
+# Where the nightly dumps live. Task 4's compose mounts a volume here; the CLI's parser aliases
+# this constant (the scheduler cannot import `cli`, so the default has to live in this module).
+DEFAULT_DUMP_DIR = pathlib.Path("/data/dump")
 
 # How far back the per-slot health summary looks: a week is enough to see a capture that has been
 # silently failing without dumping the whole table into a job_runs row.
@@ -86,8 +100,10 @@ def vacuum(conn, table: str = VACUUM_TABLE) -> str:
 
 def run_maintenance(conn, raw_root, *, now: datetime | None = None,
                     grace_hours: int = prune.DEFAULT_GRACE_HOURS,
-                    window_days: int = HEALTH_WINDOW_DAYS) -> dict:
-    """Prune, VACUUM and report health; returns the whole summary and records a `job_runs` row.
+                    window_days: int = HEALTH_WINDOW_DAYS,
+                    dump_dir=None, day: date | None = None, keep: int = dump.DEFAULT_KEEP,
+                    notifier=alerts.notify) -> dict:
+    """Dump, prune, VACUUM and report health; records a `job_runs` row and alerts the problems.
 
     The advisory lock (`maintenance`) is taken **inside** the `job_runs` row, exactly as
     `capture_slot_guarded` does — a manual run and the 03:30 scheduled run must not both walk the
@@ -104,15 +120,48 @@ def run_maintenance(conn, raw_root, *, now: datetime | None = None,
     pixels are transient by design, and the day stays recomputable — and a cross-job lock registry
     is deliberately not built for it.
 
-    The summary is `{"prune": {slots, bytes}, "vacuum": <table>, "slots": [...]}` — plain data with
-    no printing, so a second front end (plan 4) reuses it as-is. `now` and `grace_hours` are
-    injectable so tests never depend on the wall clock.
+    The summary is `{"prune": {slots, bytes}, "vacuum": <table>, "slots": [...], "dump": <path>,
+    "problems": [...]}` — plain data with no printing, so a second front end (plan 4) reuses it
+    as-is, and plan 3's keys are unchanged (R23; `dump` and `problems` are added). `now`,
+    `grace_hours`, `window_days`, `dump_dir`, `day` and `keep` are injectable so tests never depend
+    on the wall clock or a real `pg_dump`; `day` defaults to `now`'s local date and is **both** the
+    `job_runs` target and the dump's file name (R26), and the URL comes from `db.database_url()`
+    (its documented fallback), never a bare `os.environ` read.
+
+    The alert channel is injected (`notifier`) and called **after** the `job_runs` row is written,
+    from the collected lists, so a delivery problem can never corrupt the record — and the
+    scheduled path (which calls this module directly, R18/R21) gets the same alerting a CLI-only
+    hook would silently miss (R24). A failed `pg_dump` raises `DumpFailed` out of here, so the
+    audit row reads `ok = false` with the reason (`metrics` is NULL by `job_run`'s own rule); the
+    dump failure's message is alerted too.
     """
-    with job_run(conn, "maintenance") as record:
-        with advisory_lock(conn, "maintenance"):
-            pruned = prune.prune_raw(raw_root, now=now, grace_hours=grace_hours)
-            vacuumed = vacuum(conn)
-            slots = recent_slots(conn, window_days)
-            summary = {"prune": pruned, "vacuum": vacuumed, "slots": slots}
-            record["metrics"] = summary
-            return summary
+    moment = now or datetime.now(SLOT_TZ)
+    day = day or moment.date()
+    directory = pathlib.Path(dump_dir) if dump_dir is not None else DEFAULT_DUMP_DIR
+    problems: list[str] = []
+    failure: str | None = None
+    summary: dict = {}
+    try:
+        with job_run(conn, "maintenance", target=day.isoformat()) as record:
+            with advisory_lock(conn, "maintenance"):
+                pruned = prune.prune_raw(raw_root, now=moment, grace_hours=grace_hours)
+                vacuumed = vacuum(conn)
+                slots = recent_slots(conn, window_days)
+                problems = alerts.health(conn, now=moment)
+                disk = alerts.disk_usage(raw_root)
+                if disk:
+                    problems.append(disk)
+                summary = {"prune": pruned, "vacuum": vacuumed, "slots": slots,
+                           "problems": problems}
+                record["metrics"] = summary
+                try:
+                    summary["dump"] = dump.pg_dump(db.database_url(), directory, day,
+                                                   keep=keep)["path"]
+                except dump.DumpFailed as error:
+                    failure = str(error)
+                    raise
+    finally:
+        # After `job_run` wrote its row: a delivery problem must never corrupt the audit record.
+        for message in [*problems, *([failure] if failure else [])]:
+            notifier(message)
+    return summary
