@@ -23,6 +23,10 @@ def test_the_row_math_reproduces_the_shipped_rows(shipped):
     for col in ("observed_m", "gridlock_eq", "ci_raw", "freeflow", "ci"):
         assert got[col].to_numpy() == pytest.approx(want[col].to_numpy(), rel=1e-9, abs=1e-9), col
     assert list(got.columns) == list(want.columns)
+    # The key columns elementwise: a misaligned join can shift them while every value above
+    # still compares equal against a want that moved the same way.
+    for key in ("city", "area", "date", "time"):
+        assert (got[key].to_numpy() == want[key].to_numpy()).all()
 
 
 def test_the_daily_aggregation_reproduces_the_shipped_daily(shipped):
@@ -30,6 +34,7 @@ def test_the_daily_aggregation_reproduces_the_shipped_daily(shipped):
     want = shipped["daily"]
     assert len(got) == len(want) == 648
     assert got.ci.to_numpy() == pytest.approx(want.ci.to_numpy(), rel=1e-9, abs=1e-9)
+    assert list(got.columns) == ["city", "date", "ci"]
 
 
 def test_the_area_aggregation_reproduces_the_shipped_areas(shipped):
@@ -40,6 +45,10 @@ def test_the_area_aggregation_reproduces_the_shipped_areas(shipped):
     # `.all()`: a bare `assert arr == arr` raises ValueError on multi-element numpy arrays.
     assert (got.n_rows.to_numpy() == want.n_rows.to_numpy()).all()
     assert (got.n_days.to_numpy() == want.n_days.to_numpy()).all()
+    # The frozen columns are carried through from the floors frame, never re-derived — that
+    # carry-through is the reason `areas_from_rows` takes the frame at all.
+    assert (got.capacity_m.to_numpy() == want.capacity_m.to_numpy()).all()
+    assert (got.freeflow.to_numpy() == want.freeflow.to_numpy()).all()
 
 
 def test_the_city_aggregation_reproduces_the_shipped_cities(shipped):
