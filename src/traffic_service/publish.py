@@ -16,12 +16,16 @@ It runs in four moves:
    the measurements joined to `zones` on the slot's local wall clock — the same shape
    `night.clean_frame` reads — and the frozen floors come from the registry (`zones where
    publish`, R8: K and the floor are never re-derived here).
-3. **Run the generator, then check its work.** The generator is invoked with `sys.executable` and
-   three environment variables: `TRAFFIC_CSV_BASE` (the scratch dir), `TRAFFIC_CSV_OUT`
-   (`out_dir`) and `TRAFFIC_POPULATIONS_CSV` (the committed populations seed). R13: the nine CSVs
-   are written first and `manifest.json` **last**, and if the generator left any of the nine
-   missing (or written empty) the publish aborts — the manifest is what makes the site re-fetch,
-   so a half-written set must never look fresh.
+3. **Run the generator into a staging directory, check its work, then swap.** The generator is
+   invoked with `sys.executable` and three environment variables: `TRAFFIC_CSV_BASE` (the scratch
+   dir), `TRAFFIC_CSV_OUT` (a `.staging-<day>-*` directory inside `out_dir`, so the swap below is
+   a same-filesystem move) and `TRAFFIC_POPULATIONS_CSV` (the committed populations seed). The
+   nine CSVs are checked **there** — any of the nine missing (or written empty) aborts and the
+   staging directory is removed, leaving `out_dir` exactly as it was. R13: only once the set is
+   complete are the nine CSVs moved into `out_dir` (`os.replace`, atomic per file) and
+   `manifest.json` written **last** — the manifest is what makes the site re-fetch, so a
+   half-written set must never look fresh, and a generator that dies mid-run must never splice
+   new and previous CSVs under the previous manifest.
 4. **Write the manifest.** `data_version` is a **content hash** over the nine CSVs' bytes in
    sorted-name order (`<day>-<sha256[:12]>`), never a timestamp: the site re-fetches when the
    hash changes, and a timestamp would make every publish look like new data. `generated_at` is
@@ -43,6 +47,7 @@ import json
 import math
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,7 +99,8 @@ order by z.city, z.area_no, m.slot_ts
 
 class PublishAborted(RuntimeError):
     """The day was not published: validation failed, the shipping contract is not met, or the
-    generator left the set incomplete. Nothing about `out_dir` may be believed from this run."""
+    generator left the set incomplete. Nothing was moved into `out_dir` and no manifest was
+    written, so its previous contents still stand."""
 
 
 def _assert_regenerator_supports_env(script_path: pathlib.Path) -> None:
@@ -222,13 +228,31 @@ def publish_day(db, day, out_dir, populations=None) -> dict:
     with tempfile.TemporaryDirectory(prefix="traffic-publish-") as scratch:
         scratch_dir = pathlib.Path(scratch)
         _write_v2_csvs(db, floors, scratch_dir)
-        _run_regenerator(REGENERATOR, scratch_dir, out, populations)
+        # The generator writes into a staging directory on `out_dir`'s own filesystem, and the
+        # nine CSVs move in only once the set is complete: a generator that dies mid-run (disk
+        # full, pandas error, killed process) then leaves `out_dir` exactly as it was — never a
+        # splice of new CSVs under the previous manifest. `os.replace` below is same-filesystem,
+        # so each move is atomic per file.
+        staging = pathlib.Path(tempfile.mkdtemp(dir=out, prefix=f".staging-{day}-"))
+        try:
+            _run_regenerator(REGENERATOR, scratch_dir, staging, populations)
 
-    missing = [name for name in CSV_NAMES
-               if not (out / name).is_file() or (out / name).stat().st_size == 0]
-    if missing:
-        raise PublishAborted(f"the generator left {missing} missing or empty in {out} — the set "
-                             "is incomplete, so no manifest is written and the site cannot see it")
+            missing = [name for name in CSV_NAMES
+                       if not (staging / name).is_file()
+                       or (staging / name).stat().st_size == 0]
+            if missing:
+                raise PublishAborted(
+                    f"the generator left {missing} missing or empty in its staging directory "
+                    f"{staging} — the set is incomplete, so nothing is moved into {out} and no "
+                    "manifest is written; the site cannot see it")
+
+            # The nine CSVs first (R13): each an atomic same-filesystem replace, so the swap is
+            # a rename, not a rewrite.
+            for name in CSV_NAMES:
+                os.replace(staging / name, out / name)
+        finally:
+            # Best-effort: an abort must leave nothing behind and a success leaves it empty.
+            shutil.rmtree(staging, ignore_errors=True)
 
     # The manifest LAST (R13): it is the only file that makes the site re-fetch.
     counts = {name: _row_count(out / name) for name in CSV_NAMES}

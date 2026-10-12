@@ -3,7 +3,9 @@
 
 The three tests from the task brief are kept verbatim; the extras pin the rulings: the
 `data_version` is a content hash over the nine CSVs in sorted-name order (R11/R14), the manifest
-is written last and a half-written set aborts (R13), the deployed regenerator must be the
+is written last and a half-written set aborts (R13), the generator's writes go through a
+same-filesystem staging directory inside `out_dir` (so a crash mid-run cannot leave a splice of
+new and previous CSVs under the previous manifest), the deployed regenerator must be the
 parameterised copy (the brief's own `_assert_regenerator_supports_env`), the floors frame must be
 non-empty and finite (R16), and the populations seed must exist — without it every city would
 silently publish at the fallback 200000.
@@ -68,6 +70,22 @@ def _seed_day(conn, slots=12):
                                values (%s, %s, 6.0, 6.0, 6.0, 6.0, '{}')""", (zone, slot_ts))
     conn.commit()
     night.aggregate_day(conn, DAY)
+
+
+def _crashing_regenerator(out_dir, wrote):
+    """A fake generator with the env-var shape the capability check demands: it writes `wrote`
+    (a partial set) and then dies mid-run — non-zero exit, like a disk-full or pandas error."""
+    fake = out_dir / "regenerate_lovable_csv.py"
+    fake.write_text(
+        "import os, pathlib, sys\n"
+        "for name in ('TRAFFIC_CSV_BASE', 'TRAFFIC_CSV_OUT', 'TRAFFIC_POPULATIONS_CSV'):\n"
+        "    os.environ.get(name)\n"
+        "out = pathlib.Path(os.environ['TRAFFIC_CSV_OUT'])\n"
+        f"for name in {tuple(wrote)!r}:\n"
+        "    (out / name).write_text('city,congestion_index\\nAlger,5.0\\n', encoding='utf-8')\n"
+        "sys.exit('simulated crash mid-write')\n",
+        encoding="utf-8")
+    return fake
 
 
 def test_publish_writes_the_nine_csvs_and_a_manifest(db, tmp_path):
@@ -195,6 +213,45 @@ def test_a_regenerator_that_leaves_a_csv_missing_aborts_without_a_manifest(db, t
     assert "areas.csv" in str(excinfo.value)   # never written
     assert "cities.csv" in str(excinfo.value)  # written, but empty
     assert not (tmp_path / "manifest.json").exists()
+    assert not list(tmp_path.glob("*.csv")), "an incomplete set must not appear in out_dir"
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".staging-")]
+
+
+def test_a_generator_that_crashes_mid_run_leaves_out_dir_untouched(db, tmp_path, monkeypatch):
+    """The staged swap: the generator writes into a staging directory inside `out_dir` and the
+    nine CSVs move in only once the set is complete. A generator that dies after writing part of
+    the set (disk full, pandas error, killed process) therefore leaves `out_dir` exactly as it
+    was — never a splice of new CSVs under the previous manifest, the same half-written-set class
+    R13 defends against for zero-byte files."""
+    _seed_day(db)
+    monkeypatch.setattr(publish, "REGENERATOR",
+                        _crashing_regenerator(tmp_path, ("cities.csv", "areas.csv",
+                                                         "hourly.csv", "daily.csv")))
+
+    with pytest.raises(publish.PublishAborted) as excinfo:
+        publish.publish_day(db, DAY, out_dir=tmp_path, populations=POPULATIONS)
+
+    assert "exited 1" in str(excinfo.value)
+    assert not list(tmp_path.glob("*.csv")), "a crashed run must not reach the site"
+    assert not (tmp_path / "manifest.json").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".staging-")]
+
+
+def test_a_crash_mid_run_leaves_a_previous_publish_byte_unchanged(db, tmp_path, monkeypatch):
+    """The site is live between runs: a crashed re-publish must leave the previous nine CSVs and
+    the previous manifest byte-for-byte in place, not just a partial overlay of them."""
+    _seed_day(db)
+    publish.publish_day(db, DAY, out_dir=tmp_path, populations=POPULATIONS)
+    before = {name: (tmp_path / name).read_bytes() for name in (*NINE, "manifest.json")}
+
+    monkeypatch.setattr(publish, "REGENERATOR",
+                        _crashing_regenerator(tmp_path, ("cities.csv", "areas.csv")))
+    with pytest.raises(publish.PublishAborted):
+        publish.publish_day(db, DAY, out_dir=tmp_path, populations=POPULATIONS)
+
+    after = {name: (tmp_path / name).read_bytes() for name in (*NINE, "manifest.json")}
+    assert after == before, "the previous good set (and its manifest) must stand untouched"
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".staging-")]
 
 
 def test_the_deployed_regenerator_is_the_parameterised_copy():
