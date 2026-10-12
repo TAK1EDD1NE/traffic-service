@@ -105,8 +105,20 @@ def health(conn, now: datetime | None = None, hours: int = HEALTH_WINDOW_HOURS) 
 
 
 def disk_usage(path, threshold: float = DISK_ALERT_PERCENT) -> str | None:
-    """A message when `path`'s filesystem is fuller than `threshold`, else None."""
-    usage = shutil.disk_usage(str(path))
+    """A message when `path`'s filesystem is fuller than `threshold`, else None.
+
+    A missing `path` returns None rather than raising. An absent volume has no filesystem to
+    judge, and on a fresh deploy `/data/raw` does not exist until capture has run its first slot
+    — the pass's slot-health lens already reports that symptom (`no slot row for <slot>`), so the
+    disk check must not be the one read that turns a fresh deploy's maintenance run into a
+    failure (it also contradicts `prune.prune_raw`, which treats the same missing root as "nothing
+    to prune", prune.py). `FileNotFoundError` is the *only* error swallowed, so a genuine failure
+    on a path that does exist — EACCES, a bad mount — still propagates and stays loud.
+    """
+    try:
+        usage = shutil.disk_usage(str(path))
+    except FileNotFoundError:
+        return None
     percent = usage.used / usage.total * 100
     if percent <= threshold:
         return None

@@ -107,6 +107,7 @@ def test_the_night_job_closes_the_local_day_before_now(db, tmp_path, monkeypatch
 
 def test_the_maintenance_job_records_a_run_and_exits(db, tmp_path, monkeypatch):
     from traffic_service import dump, scheduler
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)  # the default notifier must not POST
     monkeypatch.setattr(dump.subprocess, "run", _fake_dump)
     result = scheduler.run_maintenance_job(tmp_path, now=datetime(2026, 10, 5, 3, 30, tzinfo=ALGIERS),
                                            dump_dir=tmp_path / "dump")

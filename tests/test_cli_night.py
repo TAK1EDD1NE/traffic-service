@@ -234,6 +234,7 @@ def test_the_night_command_passes_the_workers_and_out_dir_it_was_given(tmp_path,
 
 
 def test_maintenance_exits_zero_and_records_its_job_run(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)  # the default notifier must not POST
     monkeypatch.setattr(dump.subprocess, "run", _fake_dump)
     assert cli.main(["maintenance", "--raw-root", str(tmp_path),
                      "--dump-dir", str(tmp_path / "dump")]) == 0
@@ -248,6 +249,7 @@ def test_maintenance_exits_zero_and_records_its_job_run(db, tmp_path, monkeypatc
 
 
 def test_maintenance_prunes_and_reports_a_recent_slot(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)  # the default notifier must not POST
     raw = tmp_path / "raw"
     pruned = _an_old_slot_dir(raw)
     monkeypatch.setattr(dump.subprocess, "run", _fake_dump)

@@ -164,3 +164,54 @@ def test_run_maintenance_records_its_problems_and_alerts_them(db, tmp_path, monk
     assert metrics["dump"].endswith(".sql.gz")
     assert summary["problems"], "a run against an empty window reports its problems"
     assert sent == metrics["problems"], "every collected problem is alerted, verbatim"
+
+
+def test_maintenance_day_is_both_the_job_target_and_the_dump_file_name(db, tmp_path, monkeypatch):
+    """R26: `--day` is one date in two places — the `job_runs.target` and the dump's file name.
+
+    Nothing else pins this: the other maintenance tests leave `--day` unset (today's date), so a
+    regression that used the wall clock for the target while naming the file from `--day` (or vice
+    versa) would pass unnoticed.
+    """
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(dump.subprocess, "run", _recording_dump({}))
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    dump_dir = tmp_path / "dump"
+
+    code = cli.main(["maintenance", "--raw-root", str(raw), "--dump-dir", str(dump_dir),
+                     "--day", "2026-09-15"])
+
+    assert code == 0
+    assert (dump_dir / "2026-09-15.sql.gz").is_file(), "the dump is named for the day it closes"
+    with db.cursor() as cur:
+        cur.execute("select target, ok, metrics from job_runs order by id desc limit 1")
+        target, ok, metrics = cur.fetchone()
+    assert (target, ok) == ("2026-09-15", True)
+    assert metrics["dump"].endswith("2026-09-15.sql.gz")
+
+
+def test_the_dump_survives_a_missing_raw_root(db, tmp_path, monkeypatch):
+    """A fresh deploy, before capture has ever run: `/data/raw` does not exist.
+
+    The pass must still take its nightly backup and stay `ok = true` — the missing volume is what
+    the slot-health lens reports (`no slot row for …`), never a reason to lose the dump. This is
+    the regression the dump-before-reads order and `alerts.disk_usage`'s None-on-missing-path fix
+    guard against: with the old order the disk read raised `FileNotFoundError`, the pass ended
+    `ok = false`, and the database backup never ran.
+    """
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(dump.subprocess, "run", _recording_dump({}))
+    missing = tmp_path / "raw"           # deliberately never created
+    dump_dir = tmp_path / "dump"
+
+    code = cli.main(["maintenance", "--raw-root", str(missing), "--dump-dir", str(dump_dir)])
+
+    assert code == 0
+    assert list(dump_dir.glob("*.sql.gz")), "a missing raw root must not cost the nightly backup"
+    with db.cursor() as cur:
+        cur.execute("select job, ok, metrics from job_runs order by id desc limit 1")
+        job, ok, metrics = cur.fetchone()
+    assert (job, ok) == ("maintenance", True)
+    assert metrics["prune"] == {"slots": 0, "bytes": 0}
+    assert metrics["problems"], "the empty window is still reported through slot health"

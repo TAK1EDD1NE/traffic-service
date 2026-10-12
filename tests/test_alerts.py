@@ -114,3 +114,12 @@ def test_disk_usage_is_quiet_below_the_threshold_and_loud_above_it(monkeypatch, 
 
     Usage.used = 84 * 10**9
     assert "84%" in alerts.disk_usage(tmp_path)
+
+
+def test_disk_usage_returns_none_when_the_path_does_not_exist(tmp_path):
+    """A missing volume is not an error: a fresh deploy has no `/data/raw` yet.
+
+    The check must be incapable of failing the maintenance pass — `shutil.disk_usage` raising
+    `FileNotFoundError` used to cost the whole pass its nightly backup.
+    """
+    assert alerts.disk_usage(tmp_path / "not-created-yet") is None

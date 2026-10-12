@@ -10,10 +10,12 @@ lives in `cli.cmd_maintenance`. That split is the seam plan 4 Task 1 grows into 
 
 Four jobs, in order:
 
-- **dump** (`dump.pg_dump`) — a nightly `pg_dump` to `/data/dump` (keep 14), the file an operator
-  restores on a fresh VPS. **On by default**: a maintenance run that silently skipped the backup
-  is the failure this pass exists to prevent. A non-zero `pg_dump` raises `DumpFailed` out of
-  `run_maintenance`, so the `job_runs` row reads `ok = false` with the reason.
+- **dump** (`dump.pg_dump`) — a nightly `pg_dump` to `/data/dump`, the file an operator restores
+  on a fresh VPS. **On by default**, and **first**: a maintenance run that silently skipped the
+  backup is the failure this pass exists to prevent, so no later read (a health query, the disk
+  check) may be able to cost it. Retention is today's dump plus the `keep` newest older ones —
+  `keep + 1` files, 15 at the default `keep=14` (see `dump.py`). A non-zero `pg_dump` raises
+  `DumpFailed` out of `run_maintenance`, so the `job_runs` row reads `ok = false` with the reason.
 - **prune** (`prune.prune_raw`) — the same retention rule the night job applies, run on its own so
   pixels are still cleaned up on a day whose publish aborted (the night job prunes only after a
   successful publish, which is correct for the publish path but leaves a failed day's pixels for
@@ -126,7 +128,9 @@ def run_maintenance(conn, raw_root, *, now: datetime | None = None,
     `grace_hours`, `window_days`, `dump_dir`, `day` and `keep` are injectable so tests never depend
     on the wall clock or a real `pg_dump`; `day` defaults to `now`'s local date and is **both** the
     `job_runs` target and the dump's file name (R26), and the URL comes from `db.database_url()`
-    (its documented fallback), never a bare `os.environ` read.
+    (its documented fallback), never a bare `os.environ` read. The steps run prune → dump → vacuum →
+    health, so the backup precedes every read that could raise and `metrics` is assigned once, after
+    the dump result is known.
 
     The alert channel is injected (`notifier`) and called **after** the `job_runs` row is written,
     from the collected lists, so a delivery problem can never corrupt the record — and the
@@ -145,21 +149,29 @@ def run_maintenance(conn, raw_root, *, now: datetime | None = None,
         with job_run(conn, "maintenance", target=day.isoformat()) as record:
             with advisory_lock(conn, "maintenance"):
                 pruned = prune.prune_raw(raw_root, now=moment, grace_hours=grace_hours)
+
+                # The backup runs before every read. It is the one step whose failure fails the
+                # run, and it must never be reachable-lost to a health query or the disk check
+                # raising — a fresh deploy has no `/data/raw` yet (see `alerts.disk_usage`).
+                try:
+                    dump_path = dump.pg_dump(db.database_url(), directory, day, keep=keep)["path"]
+                except dump.DumpFailed as error:
+                    failure = str(error)
+                    raise
+
                 vacuumed = vacuum(conn)
                 slots = recent_slots(conn, window_days)
                 problems = alerts.health(conn, now=moment)
                 disk = alerts.disk_usage(raw_root)
                 if disk:
                     problems.append(disk)
+
+                # Built in one assignment, after the dump result is known: `job_run` serialises
+                # `record["metrics"]` in its `finally`, but a future one that snapshotted the dict
+                # at assignment would silently drop a key added afterwards.
                 summary = {"prune": pruned, "vacuum": vacuumed, "slots": slots,
-                           "problems": problems}
+                           "problems": problems, "dump": dump_path}
                 record["metrics"] = summary
-                try:
-                    summary["dump"] = dump.pg_dump(db.database_url(), directory, day,
-                                                   keep=keep)["path"]
-                except dump.DumpFailed as error:
-                    failure = str(error)
-                    raise
     finally:
         # After `job_run` wrote its row: a delivery problem must never corrupt the audit record.
         for message in [*problems, *([failure] if failure else [])]:
