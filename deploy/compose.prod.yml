@@ -46,6 +46,14 @@ services:
   web:
     image: ${TRAFFIC_WEB_IMAGE:-ghcr.io/tak1edd1ne/traffic-web:latest}
     volumes:
+      # FIRST DEPLOY / EMPTY VOLUME: this mount is a volume SUBPATH, so `out/` must exist
+      # before web starts or the engine refuses it — `cannot access path
+      # /var/lib/docker/volumes/.../_data/out: no such file or directory` — and, because this
+      # service is `restart: always`, web then crash-loops until it does. Nothing in web
+      # creates it (only a `night` publish does, via publish.publish_day). Create it once,
+      # with the same one-shot the migrate/seed step runs:
+      #   docker compose -f deploy/compose.prod.yml --env-file deploy/.env run --rm worker \
+      #     sh -c 'mkdir -p /data/out /data/raw /data/dump'
       # The volume's `out/` SUBPATH, never its root: with the root mounted here the
       # site would see raw/, out/ and dump/ at its data root and serve nothing at
       # /data/*.csv — and publishing into the volume root instead would expose
