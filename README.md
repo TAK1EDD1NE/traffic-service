@@ -148,3 +148,20 @@ slots** on even hours, the **night** pass at **00:30** (closing yesterday), and
   changes nothing.
 - `capture` exits **1** when a slot is not fully captured, so a scheduler wrapper
   or an operator can see it.
+
+## Deploy
+
+Production is one Coolify **Docker Compose** resource (`deploy/compose.prod.yml`) named
+`traffic-index`: three containers `db` / `worker` / `web`, one shared data volume, no published
+ports (Coolify/Traefik terminates TLS and routes the domain to `web`). Both images are built
+and pushed from the dev box — Coolify only pulls.
+
+    docker login ghcr.io -u TAK1EDD1NE                    # PAT with write:packages
+    bash deploy/build-worker.sh <tag> --push              # image A (~4.64 GB, Chromium baked in)
+    bash deploy/build-web.sh    <tag> --push              # image B (~331 MB)
+    # then set TRAFFIC_WORKER_IMAGE / TRAFFIC_WEB_IMAGE to <tag> in the Coolify env and redeploy
+
+The full operator procedure — VPS prerequisites, GHCR auth, the Coolify resource and its
+dashboard restriction, the first bring-up (including the fresh-volume bootstrap), acceptance,
+alerts, backups/restore, upgrades and troubleshooting — is in
+[`deploy/RUNBOOK.md`](deploy/RUNBOOK.md).
