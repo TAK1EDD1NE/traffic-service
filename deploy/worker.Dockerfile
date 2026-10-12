@@ -9,7 +9,11 @@
 # `parents[3] / "data engineering"`, so the package has to stay in its source tree
 # with that directory as a sibling. A wheel install would break every pipeline
 # import and every capture with PipelineNotFound.
-FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
+# Base pinned by digest. `mcr.microsoft.com/playwright/python:v1.63.0-noble` is a mutable tag, so a
+# repush under it would silently swap the Chromium baked into a rebuild. The digest below is the one
+# this image was built and smoke-tested against (recorded in task-2-build.log):
+#   mcr.microsoft.com/playwright/python:v1.63.0-noble@sha256:72bd171a9ffc2b4b59532aaa6210e21014d07093120dc25528870c0b840da1f0
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble@sha256:72bd171a9ffc2b4b59532aaa6210e21014d07093120dc25528870c0b840da1f0
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
