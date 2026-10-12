@@ -58,11 +58,12 @@ from datetime import datetime, timezone
 import pandas as pd
 from psycopg.types.json import Jsonb
 
-from traffic_service import derive, metrics
+from traffic_service import derive, metrics, prune, publish
+from traffic_service.jobs import advisory_lock, job_run
 from traffic_service.slots import SLOT_HOURS, SLOT_TZ
 
 __all__ = ["aggregate_day", "clean_frame", "images_for", "json_safe", "measure_day",
-           "run_night", "slot_dirs", "zone_id_for"]
+           "run_day", "run_night", "slot_dirs", "zone_id_for"]
 
 _SLOT_NAME = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}$")
 _STAMP = re.compile(r"_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}$")
@@ -357,3 +358,33 @@ def run_night(conn, day, raw_root, extractor=metrics.real_extractor,
     """
     counts = measure_day(conn, day, raw_root, extractor=extractor, workers=workers)
     return {**counts, **aggregate_day(conn, day)}
+
+
+def run_day(conn, day, raw_root, out_dir, *, extractor=None,
+            workers=metrics.DEFAULT_WORKERS, populations=None, now=None) -> dict:
+    """The whole night for one closed day, guarded: measure -> aggregate -> publish -> prune.
+
+    `run_night` does the measurement and the rollups; `publish.publish_day` validates the day and
+    writes the site's nine CSVs and its manifest — and may raise `publish.PublishAborted`, which
+    propagates unchanged so `job_runs.ok` is false and the `night` command can exit non-zero (that
+    exit is plan 4's alerting hook). The prune runs **only after a publish that did not raise**:
+    the pixels have been measured into `measurements` and the day is on the site, so the raw PNGs
+    have no reader left — and a day that failed validation keeps its images for the next attempt.
+
+    The advisory lock (`night:<day>`) is taken outside the `job_runs` row, as the capture job's is:
+    a second concurrent run of the same day is refused outright rather than shadowing the first.
+
+    Returns the merged summary: every `run_night` count, plus `publish` (the publisher's dict) and
+    `prune` (`{slots, bytes}`). `extractor`/`workers`/`populations`/`now` are all injectable, so
+    the flow is testable without Chromium, without the ~35 s/image pixel work, and without a
+    wall-clock dependency.
+    """
+    extractor = metrics.real_extractor if extractor is None else extractor
+    with advisory_lock(conn, f"night:{day}"):
+        with job_run(conn, "night", target=str(day)) as record:
+            summary = run_night(conn, day, raw_root, extractor=extractor, workers=workers)
+            published = publish.publish_day(conn, day, out_dir, populations=populations)
+            pruned = prune.prune_raw(raw_root, now=now)
+            record["metrics"] = {**summary, "data_version": published["data_version"],
+                                 "prune": pruned}
+            return {**summary, "publish": published, "prune": pruned}

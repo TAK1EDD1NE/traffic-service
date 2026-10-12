@@ -7,12 +7,21 @@ process starts, so this module adds no locking of its own.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import pathlib
+from datetime import datetime, timedelta
 
+from traffic_service import maintenance, night
 from traffic_service.capture import capture_slot_guarded
 from traffic_service.db import connect
 from traffic_service.jobs import JobLocked
+from traffic_service.metrics import DEFAULT_WORKERS
 from traffic_service.slots import SLOT_HOURS, SLOT_TZ, slot_for
+
+# Where the night job publishes the site's nine CSVs. Mirrors `cli.DEFAULT_OUT_DIR` (R19) — the
+# scheduler cannot import `cli` (cli imports this module lazily, and importing it back at module
+# level would close the cycle) — and `cmd_scheduler` passes cli's constant explicitly, so this
+# fallback is only for a direct `build()` caller.
+DEFAULT_OUT_DIR = pathlib.Path("/data/out")
 
 
 def slot_hours() -> list[tuple[int, int]]:
@@ -57,7 +66,39 @@ def catch_up(raw_root, capturer=None, now: datetime | None = None) -> dict | Non
     return run_slot(raw_root, capturer=capturer, now=moment)
 
 
-def build(raw_root, capturer=None, now=None):
+def run_night_job(raw_root, out_dir=None, now=None, workers=DEFAULT_WORKERS) -> dict | None:
+    """The 00:30 job: close the day before `now` — measure, aggregate, publish, prune.
+
+    The day is the **local** day before today in `SLOT_TZ` (`cli.resolve_day("yesterday")`'s rule):
+    at 00:30 the day that just closed is the one to publish. Returns None when another run holds
+    the day's advisory lock — the work is happening, just not here.
+    """
+    moment = now or datetime.now(SLOT_TZ)
+    day = (moment.astimezone(SLOT_TZ) - timedelta(days=1)).date()
+    directory = pathlib.Path(out_dir) if out_dir is not None else DEFAULT_OUT_DIR
+    try:
+        with connect() as conn:
+            return night.run_day(conn, day, raw_root, directory, workers=workers, now=moment)
+    except JobLocked:
+        logging.info("night %s is already running elsewhere; skipping", day)
+        return None
+
+
+def run_maintenance_job(raw_root, now=None) -> dict | None:
+    """The 03:30 job: prune raw PNGs, VACUUM, and record the slot health summary.
+
+    Returns None when another run holds the maintenance lock. `now` is injectable so the job is
+    testable without a wall-clock dependency (the same rule the capture jobs follow).
+    """
+    try:
+        with connect() as conn:
+            return maintenance.run_maintenance(conn, raw_root, now=now)
+    except JobLocked:
+        logging.info("maintenance is already running elsewhere; skipping")
+        return None
+
+
+def build(raw_root, out_dir=None, capturer=None, now=None):
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 
@@ -80,4 +121,29 @@ def build(raw_root, capturer=None, now=None):
             coalesce=True,
             misfire_grace_time=600,
         )
+    # The night pass, half an hour after the 22:00 slot's two-hour window closes, then maintenance
+    # once the night job has had time to finish (it is the only thing reading the raw root). Both
+    # get an hour of misfire grace — unlike a capture slot, which is a hard 2 h window, a night run
+    # that a restart delayed is still worth running late. coalesce=True means a restart that missed
+    # several fires runs the job once, not once per missed fire.
+    scheduler.add_job(
+        run_night_job,
+        trigger=CronTrigger(hour=0, minute=30, timezone=SLOT_TZ),
+        args=[raw_root],
+        kwargs={"out_dir": out_dir, "now": now},
+        id="night",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        run_maintenance_job,
+        trigger=CronTrigger(hour=3, minute=30, timezone=SLOT_TZ),
+        args=[raw_root],
+        kwargs={"now": now},
+        id="maintenance",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
     return scheduler

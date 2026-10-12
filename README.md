@@ -23,6 +23,67 @@ own virtualenv.
     uv run traffic-service migrate        # apply pending SQL migrations
     uv run traffic-service seed-zones     # upsert the zone registry from the corpus
     uv run traffic-service doctor         # schema + registry health; exits 1 when unhealthy
+    uv run traffic-service night          # close one day: measure -> publish -> prune
+    uv run traffic-service maintenance    # prune raw PNGs, VACUUM, report slot health
+
+## The night pipeline
+
+    uv run traffic-service night --day yesterday                 # the default
+    uv run traffic-service night --day 2026-10-04 --out-dir /data/out --workers 4
+
+`night` closes one day: it measures the day's twelve slot directories into
+`measurements`, runs the v2 chain over them (`ci_area_daily`, `ci_city_daily`,
+`index_daily`), **validates** the day, and only then publishes. The validation rules
+(slot count, capture ratio, zero-coverage zones, a finite national index) live in
+`validate.py`; a day that fails publishes nothing, prunes nothing, prints the reasons
+to stderr, and exits **1** — that exit code is the alerting hook.
+
+- `--day` is `yesterday` (the local day before today in `Africa/Algiers`) or
+  `YYYY-MM-DD`. A day is always local: the 00:00 slot is 23:00 UTC the day before.
+- `--raw-root` defaults to `/data/raw`, `--out-dir` to `/data/out`.
+- The whole run holds an advisory lock (`night:<day>`); a second run of the same day
+  is refused rather than allowed to shadow the first.
+- Every attempt writes a `job_runs` row: `ok` is true only when the day published.
+
+### The publish contract
+
+`publish.publish_day` writes the site's **nine CSVs** into `--out-dir` from the whole
+`measurements` history (a nightly publish refreshes the entire series, not one day),
+then writes `manifest.json` **last** — it is the only file that makes the site
+re-fetch.
+
+    {
+      "data_version": "2026-10-04-1a2b3c4d5e6f",
+      "generated_at": "2026-10-04T00:42:11+00:00",
+      "day": "2026-10-04",
+      "counts": { "cities.csv": 27, ... }
+    }
+
+`data_version` is a **content hash** (`<day>-<sha256(9 CSVs)[:12]>`), never a
+timestamp, so an unchanged publish keeps the same version and the site does not
+re-fetch. `generated_at` is informational and never feeds the hash. The CSVs are built
+in a staging directory on `--out-dir`'s own filesystem and moved in atomically, so a
+generator that dies mid-run leaves the previous good set (and its manifest) untouched.
+
+## Retention
+
+**Pixels are transient; `measurements` is forever.** Only the raw PNGs are pruned, and
+only after a day has published; every database table is retained indefinitely.
+
+    uv run traffic-service maintenance --raw-root /data/raw
+
+`prune.prune_raw` removes slot directories older than a **48 h** grace window. The
+clock is the **slot named by the directory** (`<YYYY-MM-DD>T<HH>-MM`), never the file
+mtime: a copy, an rsync, or a restore from backup resets mtimes, and an mtime clock
+would then hold pixels forever (or delete a fresh slot whose mtime came from an old
+backup). Maintenance also `VACUUM (ANALYZE)`s `measurements` and prints the last seven
+days of slot status and capture counts.
+
+## Scheduling
+
+`scheduler` runs all 14 jobs in one process on the Algiers clock: the **12 capture
+slots** on even hours, the **night** pass at **00:30** (closing yesterday), and
+**maintenance** at **03:30**. Jobs run sequentially on a single worker.
 
 ## The zone registry
 

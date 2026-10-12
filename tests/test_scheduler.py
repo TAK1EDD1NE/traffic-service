@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -34,20 +34,58 @@ def test_slot_hours_are_the_twelve_even_local_hours():
     assert slot_hours() == [(h, 0) for h in (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)]
 
 
-def test_the_scheduler_has_one_job_per_slot_hour_in_algiers():
+def test_the_scheduler_has_the_12_capture_jobs_plus_the_night_and_maintenance_jobs():
+    """12 capture slots plus the 00:30 night pass and the 03:30 maintenance pass — 14, exactly.
+
+    Asserted as an exact set (not "at least 12") so a lost or renamed job fails loudly: the two
+    ops jobs are plan 4's contract (the night exit code is its alerting hook).
+    """
     from apscheduler.triggers.cron import CronTrigger
 
     hour_index = CronTrigger.FIELD_NAMES.index("hour")
+    minute_index = CronTrigger.FIELD_NAMES.index("minute")
     scheduler = build(raw_root="unused")
     try:
-        triggers = [job.trigger for job in scheduler.get_jobs()]
-        assert len(triggers) == 12
-        assert sorted({int(str(t.fields[hour_index])) for t in triggers}) == [
-            0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
+        jobs = scheduler.get_jobs()
+        triggers = [job.trigger for job in jobs]
+        assert len(triggers) == 14
+        times = {(int(str(t.fields[hour_index])), int(str(t.fields[minute_index])))
+                 for t in triggers}
+        capture = {(h, 0) for h in (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)}
+        assert times == capture | {(0, 30), (3, 30)}
         assert {str(t.timezone) for t in triggers} == {"Africa/Algiers"}
+        assert {"night", "maintenance"} <= {job.id for job in jobs}
     finally:
         if scheduler.running:  # build() returns a stopped scheduler; shutdown() raises otherwise
             scheduler.shutdown(wait=False)
+
+
+def test_the_night_job_closes_the_local_day_before_now(db, tmp_path, monkeypatch):
+    """00:30 closes **yesterday** on the Algiers clock and hands the run to `night.run_day`."""
+    from traffic_service import night, scheduler
+
+    captured = {}
+
+    def fake_run_day(conn, day, raw_root, out_dir, **kwargs):
+        captured.update(day=day, raw_root=raw_root, out_dir=out_dir, now=kwargs.get("now"))
+        return {"ok": True}
+
+    monkeypatch.setattr(night, "run_day", fake_run_day)
+    result = scheduler.run_night_job(tmp_path, out_dir=tmp_path / "out",
+                                     now=datetime(2026, 10, 5, 0, 30, tzinfo=ALGIERS))
+
+    assert result == {"ok": True}
+    assert captured["day"] == date(2026, 10, 4), "00:30 on the 5th closes the 4th"
+    assert captured["out_dir"] == tmp_path / "out"
+
+
+def test_the_maintenance_job_records_a_run_and_exits(db, tmp_path):
+    from traffic_service import scheduler
+    result = scheduler.run_maintenance_job(tmp_path, now=datetime(2026, 10, 5, 3, 30, tzinfo=ALGIERS))
+    assert result["vacuum"] == "measurements"
+    with db.cursor() as cur:
+        cur.execute("select job, ok from job_runs where job = 'maintenance'")
+        assert cur.fetchone() == ("maintenance", True)
 
 
 def test_run_slot_captures_the_slot_containing_now(db, tmp_path):

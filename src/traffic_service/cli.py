@@ -6,16 +6,21 @@ import logging
 import pathlib
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from traffic_service import maintenance, night, publish
 from traffic_service.capture import capture_slot_guarded, load_zones
 from traffic_service.db import connect
+from traffic_service.metrics import DEFAULT_WORKERS
 from traffic_service.migrate import migrate
 from traffic_service.seed import DEFAULT_FLOOR_VERSION, seed_zones
 from traffic_service.slots import SLOT_TZ, slot_for, slot_key
 
 DATA_ENGINEERING = pathlib.Path(__file__).resolve().parents[3] / "data engineering"
 DEFAULT_RAW_ROOT = pathlib.Path("/data/raw")
+# The site's data directory — where `publish.publish_day` writes the nine CSVs and the manifest.
+# Plan 4 Task 1 adds `DEFAULT_DUMP_DIR` alongside this constant.
+DEFAULT_OUT_DIR = pathlib.Path("/data/out")
 
 
 def configure_logging(level=logging.INFO):
@@ -57,9 +62,33 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--raw-root", default=str(DEFAULT_RAW_ROOT))
     capture.add_argument("--limit", type=int, default=None, help="capture only the first N zones")
     capture.add_argument("--force", action="store_true")
-    sched = sub.add_parser("scheduler", help="run the 12-per-day capture schedule until interrupted")
+    sched = sub.add_parser("scheduler", help="run the capture + night + maintenance schedule")
     sched.add_argument("--raw-root", default=str(DEFAULT_RAW_ROOT))
+    night_parser = sub.add_parser("night", help="measure, publish, and prune one closed day")
+    night_parser.add_argument("--day", default="yesterday",
+                              help="'yesterday' or YYYY-MM-DD (local, Africa/Algiers)")
+    night_parser.add_argument("--raw-root", default=str(DEFAULT_RAW_ROOT))
+    night_parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR),
+                              help="the site's data directory the publish writes")
+    night_parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    maint = sub.add_parser("maintenance", help="prune raw PNGs and report slot health")
+    maint.add_argument("--raw-root", default=str(DEFAULT_RAW_ROOT))
     return parser
+
+
+def resolve_day(value: str):
+    """`yesterday`, or `YYYY-MM-DD` — the local day (Africa/Algiers) a night pass closes.
+
+    `yesterday` is the local day before today, not a UTC-relative one: the service's days and
+    slots are all on the Algiers wall clock, so a UTC "yesterday" would name the wrong day for the
+    six hours after local midnight.
+    """
+    if value.lower() == "yesterday":
+        return (datetime.now(SLOT_TZ) - timedelta(days=1)).date()
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as error:
+        raise SystemExit(f"--day must be 'yesterday' or YYYY-MM-DD: {value!r}") from error
 
 
 def cmd_migrate(_args) -> int:
@@ -99,10 +128,11 @@ def cmd_scheduler(args) -> int:
 
     capturer = resolve_capturer()
     catch_up(args.raw_root, capturer=capturer)
-    scheduler = build(args.raw_root, capturer=capturer)
+    scheduler = build(args.raw_root, out_dir=DEFAULT_OUT_DIR, capturer=capturer)
     scheduler.start()
     print("scheduler started; capture at " +
-          ", ".join(f"{hour:02d}:00" for hour, _ in slot_hours()) + " Africa/Algiers")
+          ", ".join(f"{hour:02d}:00" for hour, _ in slot_hours()) +
+          "; night at 00:30; maintenance at 03:30 Africa/Algiers")
     try:
         while True:
             time.sleep(3600)
@@ -133,8 +163,51 @@ def cmd_doctor(_args) -> int:
     return 0
 
 
+def cmd_night(args) -> int:
+    """Measure, publish and prune one closed day. A `PublishAborted` is the alert.
+
+    The non-zero exit on an aborted publish IS the alerting hook (plan 4 wires the channel): the
+    reasons are printed to stderr and `job_runs.ok` is false. Nothing is pruned on an abort, so the
+    day's pixels are still there for the next attempt.
+    """
+    day = resolve_day(args.day)
+    try:
+        with connect() as conn:
+            summary = night.run_day(conn, day, args.raw_root, args.out_dir, workers=args.workers)
+    except publish.PublishAborted as error:
+        print(f"night {day} aborted: {error}", file=sys.stderr)
+        return 1
+
+    published = summary["publish"]
+    pruned = summary["prune"]
+    print(f"day: {day}")
+    print(f"images: {summary['images']}  measured: {summary['measured']}  "
+          f"skipped: {summary['skipped']}  errors: {summary['errors']}  "
+          f"slots: {summary['slots']}  unknown: {len(summary['unknown'])}")
+    print(f"areas: {summary['areas']}  cities: {summary['cities']}  days: {summary['days']}")
+    print(f"data_version: {published['data_version']}")
+    print(f"pruned: {pruned['slots']} slot(s), {pruned['bytes']} byte(s)")
+    return 0
+
+
+def cmd_maintenance(args) -> int:
+    """Prune raw PNGs, VACUUM, and print the slot health summary `maintenance` returns."""
+    with connect() as conn:
+        summary = maintenance.run_maintenance(conn, args.raw_root)
+
+    pruned = summary["prune"]
+    print(f"pruned: {pruned['slots']} slot(s), {pruned['bytes']} byte(s)")
+    print(f"vacuum: {summary['vacuum']}")
+    print(f"slots (last {maintenance.HEALTH_WINDOW_DAYS} days): {len(summary['slots'])}")
+    for slot in summary["slots"]:
+        print(f"  {slot['slot']} {slot['status']} {slot['captured']}/{slot['expected']} "
+              f"failed={slot['failed']}")
+    return 0
+
+
 COMMANDS = {"migrate": cmd_migrate, "doctor": cmd_doctor, "seed-zones": cmd_seed_zones,
-            "capture": cmd_capture, "scheduler": cmd_scheduler}
+            "capture": cmd_capture, "scheduler": cmd_scheduler, "night": cmd_night,
+            "maintenance": cmd_maintenance}
 
 
 def main(argv: list[str] | None = None) -> int:
