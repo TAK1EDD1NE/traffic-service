@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from traffic_service import maintenance, night, publish
 from traffic_service.capture import capture_slot_guarded, load_zones
 from traffic_service.db import connect
+from traffic_service.jobs import JobLocked
 from traffic_service.metrics import DEFAULT_WORKERS
 from traffic_service.migrate import migrate
 from traffic_service.seed import DEFAULT_FLOOR_VERSION, seed_zones
@@ -169,6 +170,12 @@ def cmd_night(args) -> int:
     The non-zero exit on an aborted publish IS the alerting hook (plan 4 wires the channel): the
     reasons are printed to stderr and `job_runs.ok` is false. Nothing is pruned on an abort, so the
     day's pixels are still there for the next attempt.
+
+    Two non-failures must not look like failures to that channel: a `JobLocked` (another run holds
+    `night:<day>` — a cron overlap, or an operator hitting a day the scheduler is already doing)
+    prints one line and exits 0, exactly as `scheduler.run_night_job` swallows it; and a failed
+    prune after a publish that succeeded is a WARNING on stderr with exit 0, because the day is on
+    the site (the 03:30 `maintenance` pass re-attempts that prune on its own `job_runs` row).
     """
     day = resolve_day(args.day)
     try:
@@ -177,6 +184,9 @@ def cmd_night(args) -> int:
     except publish.PublishAborted as error:
         print(f"night {day} aborted: {error}", file=sys.stderr)
         return 1
+    except JobLocked as error:
+        print(f"night {day} skipped: {error}")
+        return 0
 
     published = summary["publish"]
     pruned = summary["prune"]
@@ -187,6 +197,9 @@ def cmd_night(args) -> int:
     print(f"areas: {summary['areas']}  cities: {summary['cities']}  days: {summary['days']}")
     print(f"data_version: {published['data_version']}")
     print(f"pruned: {pruned['slots']} slot(s), {pruned['bytes']} byte(s)")
+    if "error" in pruned:
+        print(f"warning: night {day} published, but the prune failed: {pruned['error']}",
+              file=sys.stderr)
     return 0
 
 

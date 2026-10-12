@@ -89,16 +89,27 @@ def run_maintenance(conn, raw_root, *, now: datetime | None = None,
                     window_days: int = HEALTH_WINDOW_DAYS) -> dict:
     """Prune, VACUUM and report health; returns the whole summary and records a `job_runs` row.
 
-    The advisory lock (`maintenance`) is taken outside the `job_runs` row, as the night job's is:
-    a manual run and the 03:30 scheduled run must not both walk the raw root, or the second's
-    `rmtree` races the first's and raises `FileNotFoundError` mid-walk.
+    The advisory lock (`maintenance`) is taken **inside** the `job_runs` row, exactly as
+    `capture_slot_guarded` does — a manual run and the 03:30 scheduled run must not both walk the
+    raw root, or the second's `rmtree` races the first's and raises `FileNotFoundError` mid-walk.
+    A run refused by the lock raises `JobLocked` unchanged, having still left `ok = true` with
+    `metrics {"skipped": "locked"}`: a duplicate is not a failure.
+
+    **Accepted cross-job race (not fixed, deliberately).** This pass prunes on the 48 h slot clock
+    while holding only its own lock — it does not take, or wait on, any day's `night:<day>` lock.
+    So an operator `night --day <d>` backfill of a day older than 48 h can have its PNGs removed
+    mid-measure by a maintenance run that happens to be walking the same root: run that backfill
+    with the scheduler stopped. The acceptance is conscious — every measurement the backfill needs
+    is already in `measurements` (or is rewritten by the day's own slot directories), the raw
+    pixels are transient by design, and the day stays recomputable — and a cross-job lock registry
+    is deliberately not built for it.
 
     The summary is `{"prune": {slots, bytes}, "vacuum": <table>, "slots": [...]}` — plain data with
     no printing, so a second front end (plan 4) reuses it as-is. `now` and `grace_hours` are
     injectable so tests never depend on the wall clock.
     """
-    with advisory_lock(conn, "maintenance"):
-        with job_run(conn, "maintenance") as record:
+    with job_run(conn, "maintenance") as record:
+        with advisory_lock(conn, "maintenance"):
             pruned = prune.prune_raw(raw_root, now=now, grace_hours=grace_hours)
             vacuumed = vacuum(conn)
             slots = recent_slots(conn, window_days)

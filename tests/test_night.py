@@ -5,8 +5,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from traffic_service import derive, night
+from traffic_service import derive, night, prune, publish
 from traffic_service.db import connect
+from traffic_service.jobs import JobLocked
 from traffic_service.migrate import migrate
 from traffic_service.slots import SLOT_TZ
 
@@ -230,3 +231,70 @@ def test_aggregate_day_writes_the_days_numbers(db, raw_root):
                          ("Alger", 2, pytest.approx(20.0), pytest.approx(0.24), 3)]
     assert city_rows == [("Alger", pytest.approx(20.0), pytest.approx(0.24), 2)]
     assert index_row == (DAY, pytest.approx(20.0), 1, 2, pytest.approx(0.24))
+
+
+# --- `run_day`: the lock is inside the audit row, and the prune cannot colour the night ---
+
+_DAY_COUNTS = {"images": 6, "measured": 6, "skipped": 0, "errors": 0, "slots": 3,
+               "unknown": [], "areas": 2, "cities": 1, "days": 1}
+
+
+def _publish_result():
+    return {"data_version": "2026-10-04-abc123def456", "day": DAY,
+            "counts": {"cities.csv": 1}, "csvs": ["cities.csv"]}
+
+
+def test_run_day_is_refused_but_still_records_an_ok_skip_when_another_run_holds_the_day(
+        db, raw_root, tmp_path):
+    """A duplicate is not a failure, and the audit row must say so.
+
+    The lock is taken **inside** the `job_runs` row (the capture job's shape): the refused run
+    raises `JobLocked` unchanged and still leaves `ok = true` with `metrics {"skipped": "locked"}`.
+    That row is the only place the service records "the work is happening elsewhere" — take the
+    lock before the row and a locked-out run writes nothing at all.
+    """
+    with connect() as other:
+        with other.cursor() as cur:
+            cur.execute("select pg_try_advisory_lock(hashtext(%s))", (f"night:{DAY}",))
+            assert cur.fetchone()[0] is True, "the test must hold exactly the day's own key"
+        try:
+            with pytest.raises(JobLocked):
+                night.run_day(db, DAY, raw_root, tmp_path / "out")
+        finally:
+            with other.cursor() as cur:
+                cur.execute("select pg_advisory_unlock(hashtext(%s))", (f"night:{DAY}",))
+            other.commit()
+
+    with db.cursor() as cur:
+        cur.execute("select job, target, ok, metrics, error from job_runs where job = 'night'")
+        job, target, ok, metrics, error = cur.fetchone()
+    assert (job, target, ok, error) == ("night", str(DAY), True, None)
+    assert metrics == {"skipped": "locked"}
+
+
+def test_a_failed_prune_does_not_fail_a_published_night(db, raw_root, tmp_path, monkeypatch):
+    """The night's verdict is its publish, not its aftermath.
+
+    The prune runs after the `job_runs` row exists, and a prune failure is caught: the day stays
+    `ok = true` (and the CLI exits 0) with the error carried in the returned summary, instead of a
+    false alert on plan 4's channel. The 03:30 `maintenance` pass re-attempts the same prune.
+    """
+    monkeypatch.setattr(night, "run_night", lambda *a, **k: dict(_DAY_COUNTS))
+    monkeypatch.setattr(publish, "publish_day", lambda *a, **k: _publish_result())
+
+    def boom(*args, **kwargs):
+        raise OSError("disk went away")
+
+    monkeypatch.setattr(prune, "prune_raw", boom)
+
+    summary = night.run_day(db, DAY, raw_root, tmp_path / "out")
+
+    assert summary["prune"] == {"slots": 0, "bytes": 0, "error": "OSError: disk went away"}
+    assert summary["publish"]["data_version"] == "2026-10-04-abc123def456"
+    assert summary["measured"] == 6, "the night's own counts are untouched by a prune failure"
+    with db.cursor() as cur:
+        cur.execute("select ok, metrics, error from job_runs where job = 'night'")
+        ok, metrics, error = cur.fetchone()
+    assert (ok, error) == (True, None), "a failed prune must not mark the night failed"
+    assert metrics["data_version"] == "2026-10-04-abc123def456"
+    assert "prune" not in metrics, "the audit row is written before the prune runs"

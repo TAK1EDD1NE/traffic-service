@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from traffic_service.slots import (SLOT_HOURS, is_slot_start, slot_after,
-                                   slot_for, slot_key, slot_label)
+                                   slot_for, slot_key, slot_label, slot_start_from_name)
 
 ALGIERS = ZoneInfo("Africa/Algiers")
 
@@ -58,3 +58,30 @@ def test_slot_key_and_label_are_local_wall_clock():
     slot = datetime(2026, 10, 5, 14, 0, tzinfo=ALGIERS).astimezone(timezone.utc)
     assert slot_key(slot) == "2026-10-05T14-00"
     assert slot_label(slot) == "2026-10-05_14-00"
+
+
+def test_slot_start_from_name_is_the_inverse_of_slot_key():
+    """The one implementation of the raw-root directory convention (`night` and `prune` delegate).
+
+    `slot_key` writes the name; this reads it back as an aware local slot start, and it rejects
+    every name that is not a real slot start, so neither the day walk nor the prune can mistake a
+    stray directory for a capture slot.
+    """
+    start = slot_start_from_name("2026-10-04T22-00")
+    assert start == datetime(2026, 10, 4, 22, 0, tzinfo=ALGIERS)
+    assert start.tzinfo is not None, "a naive result would crash the age arithmetic"
+    for slot in (0, 2, 12, 22):
+        moment = datetime(2026, 10, 4, slot, 0, tzinfo=ALGIERS).astimezone(timezone.utc)
+        assert slot_start_from_name(slot_key(moment)) == moment.astimezone(ALGIERS)
+
+
+def test_slot_start_from_name_rejects_anything_that_is_not_a_slot_start():
+    assert slot_start_from_name("2026-10-04T01-00") is None      # odd hour
+    assert slot_start_from_name("2026-10-04T00-30") is None      # not on the hour
+    assert slot_start_from_name("2026-13-04T00-00") is None      # impossible month
+    assert slot_start_from_name("2026-10-04T24-00") is None      # impossible hour
+    assert slot_start_from_name("nonsense") is None
+    assert slot_start_from_name("2026-10-04T00-00") is not None
+    assert slot_start_from_name("2026-10-04 00-00") is None      # the separator is part of it
+    assert slot_start_from_name("/2026-10-04T00-00/") is None
+    assert slot_start_from_name("2026-10-04T00-00.backup") is None

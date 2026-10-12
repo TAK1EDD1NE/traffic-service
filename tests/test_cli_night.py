@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from traffic_service import cli, night, publish
+from traffic_service import cli, night, prune, publish
 from traffic_service.db import connect
 from traffic_service.migrate import migrate
 from traffic_service.slots import SLOT_TZ, slot_for, slot_key
@@ -99,6 +99,7 @@ def test_a_successful_night_commits_its_job_run_row_with_the_publish_and_prune_o
     assert code == 0
     out = capsys.readouterr().out
     assert "data_version: 2026-10-04-abc123def456" in out
+    assert "pruned: 1 slot(s), 3 byte(s)" in out
     assert not pruned.exists(), "the prune runs only after a successful publish"
     with db.cursor() as cur:
         cur.execute("select job, target, ok, metrics from job_runs where job = 'night'")
@@ -106,7 +107,97 @@ def test_a_successful_night_commits_its_job_run_row_with_the_publish_and_prune_o
     assert (job, target, ok) == ("night", "2026-10-04", True)
     assert metrics["data_version"] == "2026-10-04-abc123def456"
     assert metrics["measured"] == 6
-    assert metrics["prune"] == {"slots": 1, "bytes": 3}
+    assert "prune" not in metrics, "the prune runs after the audit row is written"
+
+
+def _hold(key: str):
+    """A second session holding `key`'s advisory lock, for the duration of the `with` block."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def held():
+        with connect() as other:
+            with other.cursor() as cur:
+                cur.execute("select pg_try_advisory_lock(hashtext(%s))", (key,))
+                assert cur.fetchone()[0] is True
+            try:
+                yield
+            finally:
+                with other.cursor() as cur:
+                    cur.execute("select pg_advisory_unlock(hashtext(%s))", (key,))
+                other.commit()
+
+    return held()
+
+
+def test_night_exits_zero_and_says_it_was_skipped_when_another_run_holds_the_day(db, tmp_path,
+                                                                                capsys):
+    """A cron overlap is not a failure: plan 4's channel must not be paged for a duplicate.
+
+    `cmd_night` treats `JobLocked` exactly as `scheduler.run_night_job` does — one line, exit 0 —
+    and the refused run still leaves its `ok = true` / `{"skipped": "locked"}` audit row.
+    """
+    with _hold("night:2026-10-04"):
+        code = cli.main(["night", "--day", "2026-10-04", "--raw-root", str(tmp_path / "raw"),
+                         "--out-dir", str(tmp_path / "out")])
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "skipped" in captured.out
+    assert "night:2026-10-04" in captured.out
+    with db.cursor() as cur:
+        cur.execute("select target, ok, metrics from job_runs where job = 'night'")
+        target, ok, metrics = cur.fetchone()
+    assert (target, ok) == ("2026-10-04", True)
+    assert metrics == {"skipped": "locked"}
+
+
+def test_night_exits_zero_and_warns_on_stderr_when_the_prune_fails(db, tmp_path, monkeypatch,
+                                                                   capsys):
+    """A prune failure after a good publish is a WARNING, not an alert: the day is on the site.
+
+    Only `PublishAborted` may exit non-zero (that is the alerting hook). The pixels' fate is the
+    03:30 `maintenance` job's business, and it re-attempts the same prune on its own row.
+    """
+    monkeypatch.setattr(night, "run_night", lambda *a, **k: _summary())
+    monkeypatch.setattr(publish, "publish_day", lambda *a, **k: _publish_result())
+
+    def boom(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(prune, "prune_raw", boom)
+    raw = tmp_path / "raw"
+    kept = _an_old_slot_dir(raw)
+
+    code = cli.main(["night", "--day", "2026-10-04", "--raw-root", str(raw),
+                     "--out-dir", str(tmp_path / "out")])
+
+    assert code == 0, "a failed prune must not fail a night that published"
+    captured = capsys.readouterr()
+    assert "OSError: read-only filesystem" in captured.err
+    assert "warning" in captured.err
+    assert "data_version: 2026-10-04-abc123def456" in captured.out
+    assert kept.exists()
+    with db.cursor() as cur:
+        cur.execute("select ok, metrics from job_runs where job = 'night'")
+        ok, metrics = cur.fetchone()
+    assert ok is True
+    assert metrics["data_version"] == "2026-10-04-abc123def456"
+
+
+def test_the_maintenance_job_skips_without_raising_when_its_lock_is_held(db, tmp_path):
+    """A held `maintenance` lock records the skip on its own `job_runs` row and returns None out
+    of the scheduler wrapper (the job is running elsewhere; a timer overlap is not an error)."""
+    from traffic_service import scheduler
+
+    with _hold("maintenance"):
+        assert scheduler.run_maintenance_job(tmp_path) is None
+
+    with db.cursor() as cur:
+        cur.execute("select job, ok, metrics from job_runs where job = 'maintenance'")
+        job, ok, metrics = cur.fetchone()
+    assert (job, ok) == ("maintenance", True)
+    assert metrics == {"skipped": "locked"}
 
 
 def test_the_night_command_passes_the_workers_and_out_dir_it_was_given(tmp_path, monkeypatch):

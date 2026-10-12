@@ -110,3 +110,20 @@ def test_slot_start_reads_only_even_local_hours():
     assert prune.slot_start("2026-10-04T01-00") is None
     assert prune.slot_start("2026-13-04T00-00") is None      # impossible month
     assert prune.slot_start("nonsense") is None
+
+
+def test_the_slot_parser_is_the_shared_slots_implementation():
+    """One implementation, two delegations: the day walk and the prune must agree on what a slot
+    directory is, or a drift makes one of them silently stop recognising the other's directories.
+
+    `night` is imported here (not at module level) so this file stays runnable without the pixel
+    extra; the point is the *values*, not the import graph.
+    """
+    from traffic_service import night
+    from traffic_service.slots import slot_start_from_name
+
+    for name in ("2026-10-04T00-00", "2026-10-04T22-00", "2026-10-04T01-00",
+                 "2026-10-04T00-30", "2026-13-04T00-00", "nonsense"):
+        assert prune.slot_start(name) == slot_start_from_name(name), name
+        assert night._parse_slot(name) == slot_start_from_name(name), name
+    assert prune.slot_start("2026-10-04T04-00") == night._parse_slot("2026-10-04T04-00")

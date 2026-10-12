@@ -41,9 +41,15 @@ to stderr, and exits **1** — that exit code is the alerting hook.
 - `--day` is `yesterday` (the local day before today in `Africa/Algiers`) or
   `YYYY-MM-DD`. A day is always local: the 00:00 slot is 23:00 UTC the day before.
 - `--raw-root` defaults to `/data/raw`, `--out-dir` to `/data/out`.
-- The whole run holds an advisory lock (`night:<day>`); a second run of the same day
-  is refused rather than allowed to shadow the first.
-- Every attempt writes a `job_runs` row: `ok` is true only when the day published.
+- The whole run holds an advisory lock (`night:<day>`), taken inside the job's
+  `job_runs` row; a second run of the same day is refused rather than allowed to
+  shadow the first, records `ok = true` with `metrics {"skipped": "locked"}`, and
+  the CLI exits **0** — a cron overlap is not a failure.
+- Every attempt writes a `job_runs` row: `ok` is false only when the day itself failed
+  (an aborted publish is the one such case here).
+- The prune runs after a publish that succeeded and outside the `job_runs` row: a
+  prune that fails prints a WARNING to stderr and still exits **0**, because the day
+  is on the site. The 03:30 `maintenance` pass re-attempts it on its own row.
 
 ### The publish contract
 
@@ -68,7 +74,9 @@ generator that dies mid-run leaves the previous good set (and its manifest) unto
 ## Retention
 
 **Pixels are transient; `measurements` is forever.** Only the raw PNGs are pruned, and
-only after a day has published; every database table is retained indefinitely.
+only after a day has published; every database table is retained indefinitely. A prune
+that fails never fails the night (see above) — it is `maintenance`'s job to age the
+pixels out, and that is where a persistent prune failure shows up.
 
     uv run traffic-service maintenance --raw-root /data/raw
 
@@ -76,8 +84,11 @@ only after a day has published; every database table is retained indefinitely.
 clock is the **slot named by the directory** (`<YYYY-MM-DD>T<HH>-MM`), never the file
 mtime: a copy, an rsync, or a restore from backup resets mtimes, and an mtime clock
 would then hold pixels forever (or delete a fresh slot whose mtime came from an old
-backup). Maintenance also `VACUUM (ANALYZE)`s `measurements` and prints the last seven
-days of slot status and capture counts.
+backup). The directory-name parse lives once, in `slots.slot_start_from_name`, and both
+the night walk and the prune delegate to it. Maintenance also `VACUUM (ANALYZE)`s
+`measurements` and prints the last seven days of slot status and capture counts. It
+prunes on the slot clock while holding only its own lock, so an operator backfill of a
+day older than 48 h (`night --day <d>`) must be run with the scheduler stopped.
 
 ## Scheduling
 

@@ -14,17 +14,19 @@ forever; this module issues no statement against the database at all, which is w
 retention rule (`spec:125-129`) trivially true.
 
 The prune runs last in the night job and only after a publish that did not raise: a day that
-failed validation still needs its pixels for the next attempt.
+failed validation still needs its pixels for the next attempt. It runs *outside* the night's
+`job_runs` row (see `night.run_day`), so a prune that fails cannot colour the night's verdict —
+the pixels are transient, the published day is not. The `maintenance` pass, which prunes on the
+same rule, is where a persistent prune failure surfaces.
 """
 from __future__ import annotations
 
 import logging
 import pathlib
-import re
 import shutil
 from datetime import datetime, timedelta
 
-from traffic_service.slots import SLOT_HOURS, SLOT_TZ
+from traffic_service.slots import SLOT_TZ, slot_start_from_name
 
 __all__ = ["DEFAULT_GRACE_HOURS", "prune_raw", "slot_start"]
 
@@ -32,28 +34,16 @@ __all__ = ["DEFAULT_GRACE_HOURS", "prune_raw", "slot_start"]
 # debugging window still has the images that produced a suspicious measurement.
 DEFAULT_GRACE_HOURS = 48
 
-# The same shape `night._parse_slot` accepts. The regex is duplicated rather than imported
-# because `night` imports this module (R18) and a shared `night` import here would be circular.
-_SLOT_NAME = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}$")
-
 
 def slot_start(name: str) -> datetime | None:
     """`<YYYY-MM-DD>T<HH>-MM` -> the slot start as aware local time, else `None`.
 
-    Only real even-hour slots count, and the regex cannot rule out an impossible date (month 13)
-    so the parse is guarded too — the same rule `night.slot_dirs` uses to decide which
-    directories are a day's slots. A directory that is not a capture slot is never treated as
-    one, and so is never pruned.
+    A thin delegation to `slots.slot_start_from_name`, which owns the directory convention — the
+    night job decides which directories are a day's slots through the same function, so the two
+    cannot drift apart (a drift would make this module silently prune nothing). The name is kept
+    because it is this module's published surface.
     """
-    if not _SLOT_NAME.match(name):
-        return None
-    try:
-        start = datetime.strptime(name, "%Y-%m-%dT%H-%M")
-    except ValueError:
-        return None
-    if start.minute != 0 or start.hour not in SLOT_HOURS:
-        return None
-    return start.replace(tzinfo=SLOT_TZ)
+    return slot_start_from_name(name)
 
 
 def _bytes_in(directory) -> int:

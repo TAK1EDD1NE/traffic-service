@@ -50,6 +50,7 @@ default, tests pass a fake and skip the ~35 s/image pixel work.
 """
 from __future__ import annotations
 
+import logging
 import math
 import pathlib
 import re
@@ -60,12 +61,11 @@ from psycopg.types.json import Jsonb
 
 from traffic_service import derive, metrics, prune, publish
 from traffic_service.jobs import advisory_lock, job_run
-from traffic_service.slots import SLOT_HOURS, SLOT_TZ
+from traffic_service.slots import SLOT_TZ, slot_start_from_name
 
 __all__ = ["aggregate_day", "clean_frame", "images_for", "json_safe", "measure_day",
            "run_day", "run_night", "slot_dirs", "zone_id_for"]
 
-_SLOT_NAME = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}$")
 _STAMP = re.compile(r"_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}$")
 
 # The SQL lives at the top and the parameters are the only variables — the capture module's shape.
@@ -141,18 +141,11 @@ on conflict (day) do update set
 def _parse_slot(name: str) -> datetime | None:
     """`<YYYY-MM-DD>T<HH>-00` -> the slot start as aware local time, else `None`.
 
-    The regex cannot rule out an impossible date (month 13), so the parse is guarded too, and
-    the even-hour/minute check is what keeps a stray `T01-00` directory out.
+    A thin delegation to `slots.slot_start_from_name`, the one implementation of the raw-root
+    directory convention: `prune` decides what may be deleted through the same function, so the
+    two can never disagree about which directories are slots.
     """
-    if not _SLOT_NAME.match(name):
-        return None
-    try:
-        start = datetime.strptime(name, "%Y-%m-%dT%H-%M")
-    except ValueError:
-        return None
-    if start.minute != 0 or start.hour not in SLOT_HOURS:
-        return None
-    return start.replace(tzinfo=SLOT_TZ)
+    return slot_start_from_name(name)
 
 
 def slot_dirs(day, raw_root) -> list[pathlib.Path]:
@@ -367,24 +360,52 @@ def run_day(conn, day, raw_root, out_dir, *, extractor=None,
     `run_night` does the measurement and the rollups; `publish.publish_day` validates the day and
     writes the site's nine CSVs and its manifest — and may raise `publish.PublishAborted`, which
     propagates unchanged so `job_runs.ok` is false and the `night` command can exit non-zero (that
-    exit is plan 4's alerting hook). The prune runs **only after a publish that did not raise**:
-    the pixels have been measured into `measurements` and the day is on the site, so the raw PNGs
-    have no reader left — and a day that failed validation keeps its images for the next attempt.
+    exit is plan 4's alerting hook).
 
-    The advisory lock (`night:<day>`) is taken outside the `job_runs` row, as the capture job's is:
-    a second concurrent run of the same day is refused outright rather than shadowing the first.
+    The advisory lock (`night:<day>`) is taken **inside** the `job_runs` row, exactly as
+    `capture_slot_guarded` does: a second concurrent run of the same day is refused with
+    `JobLocked`, which propagates to the caller — and because the lock is taken under the audit
+    row, the run that was refused still leaves `ok = true` with `metrics {"skipped": "locked"}`.
+    A duplicate is not a failure (the work is happening, just elsewhere); that row is the only
+    place the service records so.
+
+    The prune runs **only after a publish that did not raise**, and **outside** the `job_runs`
+    row: the pixels have been measured into `measurements` and the day is on the site, so the raw
+    PNGs have no reader left — and a day that failed validation keeps its images for the next
+    attempt. It is opportunistic, so a prune failure is caught and reported in the summary
+    (`{"prune": {"error": "<type>: <msg>"}}`, with zero counts) rather than colouring the night's
+    verdict: a published day stays `ok = true` and the command exits 0. A persistent prune failure
+    is what the 03:30 `maintenance` job's own `job_runs` row surfaces.
 
     Returns the merged summary: every `run_night` count, plus `publish` (the publisher's dict) and
-    `prune` (`{slots, bytes}`). `extractor`/`workers`/`populations`/`now` are all injectable, so
-    the flow is testable without Chromium, without the ~35 s/image pixel work, and without a
-    wall-clock dependency.
+    `prune` (`{slots, bytes}`, or `{slots: 0, bytes: 0, error}` when the prune failed).
+    `extractor`/`workers`/`populations`/`now` are all injectable, so the flow is testable without
+    Chromium, without the ~35 s/image pixel work, and without a wall-clock dependency.
     """
     extractor = metrics.real_extractor if extractor is None else extractor
-    with advisory_lock(conn, f"night:{day}"):
-        with job_run(conn, "night", target=str(day)) as record:
+    with job_run(conn, "night", target=str(day)) as record:
+        with advisory_lock(conn, f"night:{day}"):
             summary = run_night(conn, day, raw_root, extractor=extractor, workers=workers)
             published = publish.publish_day(conn, day, out_dir, populations=populations)
-            pruned = prune.prune_raw(raw_root, now=now)
-            record["metrics"] = {**summary, "data_version": published["data_version"],
-                                 "prune": pruned}
-            return {**summary, "publish": published, "prune": pruned}
+        # The audit row is written when `job_run` exits, so it cannot carry the prune's outcome:
+        # the prune is the night's aftermath, not part of its verdict.
+        record["metrics"] = {**summary, "data_version": published["data_version"]}
+
+    pruned = _prune(raw_root, now=now)
+    if "error" in pruned:
+        logging.warning("prune after %s failed: %s", day, pruned["error"])
+    return {**summary, "publish": published, "prune": pruned}
+
+
+def _prune(raw_root, now: datetime | None = None) -> dict:
+    """`prune.prune_raw`, but its failure is a returned error, never an exception.
+
+    The night's verdict is its publish: a day that reached the site must not be marked failed
+    because a stale directory could not be removed (that would page someone about a disk the
+    measurements do not need). The error is carried in the summary — and printed by `cmd_night` —
+    and the next `maintenance` run re-attempts the same prune on its own `job_runs` row.
+    """
+    try:
+        return prune.prune_raw(raw_root, now=now)
+    except Exception as exc:  # noqa: BLE001 — a prune failure is data, not the job's verdict
+        return {"slots": 0, "bytes": 0, "error": f"{type(exc).__name__}: {exc}"}
