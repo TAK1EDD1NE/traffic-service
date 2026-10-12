@@ -8,9 +8,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pandas>=2.2"]
+dev = ["pytest>=8.0"]
 browser = ["playwright>=1.54"]
-pipeline = ["opencv-python>=4.10", "scikit-image>=0.24", "scipy>=1.13", "tqdm>=4.66"]
+# `pandas` is a RUNTIME import (`derive`, `night`, `publish` all import it at module scope, and
+# `cli` imports those), so it belongs to the extra the worker image installs — the same
+# `[browser,pipeline]` set. The suite runs with BOTH extras (see README).
+pipeline = ["opencv-python>=4.10", "pandas>=2.2", "scikit-image>=0.24", "scipy>=1.13",
+            "tqdm>=4.66"]
 
 [project.scripts]
 traffic-service = "traffic_service.cli:main"

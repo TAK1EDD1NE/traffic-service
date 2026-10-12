@@ -10,8 +10,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 from traffic_service import pipeline
 
-# The 26 columns the `measurements` table promotes, in the migration's own order. The pipeline's
-# remaining eight (`filename`, `timestamp_processed`, the four `{c}_px` and four `{c}_pct`) are
+# The 24 columns the `measurements` table promotes, in the migration's own order. The pipeline's
+# remaining ten (`filename`, `timestamp_processed`, the four `{c}_px` and four `{c}_pct`) are
 # not promoted: the first two are job bookkeeping, and the last eight are pure functions of the
 # promoted columns, so they stay recoverable from `payload` (see the migration comment).
 MEASUREMENT_COLUMNS = (
@@ -27,7 +27,7 @@ MEASUREMENT_COLUMNS = (
 DEFAULT_WORKERS = 4
 
 
-def _project(row: dict) -> dict:
+def project(row: dict) -> dict:
     """Keep the promoted columns and normalise the error field to a plain string."""
     out = {k: row.get(k) for k in MEASUREMENT_COLUMNS}
     out["error"] = (row.get("error") or "").strip()
@@ -51,7 +51,7 @@ def measure_image(path) -> dict:
 
     Pure enough to run in a worker process.
     """
-    return _project(measure_image_full(path))
+    return project(measure_image_full(path))
 
 
 def real_extractor(path):
@@ -73,7 +73,7 @@ def _pin_threads() -> None:
 
 def _worker(path):
     _pin_threads()
-    return measure_image(path)
+    return measure_image_full(path)
 
 
 def measure_slot(paths, extractor=real_extractor, workers=DEFAULT_WORKERS) -> list[dict]:

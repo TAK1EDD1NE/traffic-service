@@ -7,6 +7,7 @@ this must stay comparable with was sampled on local hours.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -55,3 +56,33 @@ def slot_key(slot_ts: datetime) -> str:
 def slot_label(slot_ts: datetime) -> str:
     """The timestamp the scraper's filename convention uses: local wall clock."""
     return as_local(slot_ts).strftime("%Y-%m-%d_%H-%M")
+
+
+# The raw-root directory convention: `<YYYY-MM-DD>T<HH>-<MM>` in local wall clock — exactly the
+# text `slot_key` writes. One regex, one function, in the module that owns the convention: the
+# night job (which walks the day's slot directories) and the prune (which ages them out) must
+# agree on what a slot directory *is*, or one of them silently stops recognising the other's.
+_SLOT_NAME = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}$")
+
+
+def slot_start_from_name(name: str) -> datetime | None:
+    """`<YYYY-MM-DD>T<HH>-MM` -> the slot start as aware local time, else `None`.
+
+    The inverse of `slot_key`, and the only implementation of the directory-name parse: `night`
+    (which decides a day's slot directories) and `prune` (which decides what may be deleted) both
+    delegate here, so the convention cannot drift between the two.
+
+    Only real slot starts count: the regex cannot rule out an impossible date (month 13), so the
+    parse is guarded too, and the even-hour / zero-minute check rejects a stray `T01-00` or
+    `T00-30` name. A name this returns `None` for is not a capture slot and is never measured or
+    pruned.
+    """
+    if not _SLOT_NAME.match(name):
+        return None
+    try:
+        start = datetime.strptime(name, "%Y-%m-%dT%H-%M")
+    except ValueError:
+        return None
+    if start.minute != 0 or start.hour not in SLOT_HOURS:
+        return None
+    return start.replace(tzinfo=SLOT_TZ)

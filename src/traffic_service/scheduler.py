@@ -7,12 +7,21 @@ process starts, so this module adds no locking of its own.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import pathlib
+from datetime import datetime, timedelta
 
+from traffic_service import maintenance, night
 from traffic_service.capture import capture_slot_guarded
 from traffic_service.db import connect
 from traffic_service.jobs import JobLocked
+from traffic_service.metrics import DEFAULT_WORKERS
 from traffic_service.slots import SLOT_HOURS, SLOT_TZ, slot_for
+
+# Where the night job publishes the site's nine CSVs. Mirrors `cli.DEFAULT_OUT_DIR` (R19) — the
+# scheduler cannot import `cli` (cli imports this module lazily, and importing it back at module
+# level would close the cycle) — and `cmd_scheduler` passes cli's constant explicitly, so this
+# fallback is only for a direct `build()` caller.
+DEFAULT_OUT_DIR = pathlib.Path("/data/out")
 
 
 def slot_hours() -> list[tuple[int, int]]:
@@ -57,7 +66,65 @@ def catch_up(raw_root, capturer=None, now: datetime | None = None) -> dict | Non
     return run_slot(raw_root, capturer=capturer, now=moment)
 
 
-def build(raw_root, capturer=None, now=None):
+def run_night_job(raw_root, out_dir=None, now=None, workers=DEFAULT_WORKERS) -> dict | None:
+    """The 00:30 job: close the day before `now` — measure, aggregate, publish, prune.
+
+    The day is the **local** day before today in `SLOT_TZ` (`cli.resolve_day("yesterday")`'s rule):
+    at 00:30 the day that just closed is the one to publish. Returns None when another run holds
+    the day's advisory lock — the work is happening, just not here.
+
+    The scheduled path has no console of its own (unlike `cli.cmd_night`, which prints to an
+    operator's terminal), so the run's summary is logged as **one line**: the same counts, the
+    `data_version` and the prune outcome, so `docker compose logs worker` shows the night's
+    outcome. The `job_runs` row stays the audit record; a failed prune is additionally a WARNING
+    out of `night.run_day` itself.
+    """
+    moment = now or datetime.now(SLOT_TZ)
+    day = (moment.astimezone(SLOT_TZ) - timedelta(days=1)).date()
+    directory = pathlib.Path(out_dir) if out_dir is not None else DEFAULT_OUT_DIR
+    try:
+        with connect() as conn:
+            summary = night.run_day(conn, day, raw_root, directory, workers=workers, now=moment)
+    except JobLocked:
+        logging.info("night %s is already running elsewhere; skipping", day)
+        return None
+    published = summary["publish"]
+    pruned = summary["prune"]
+    logging.info(
+        "night %s: images: %s  measured: %s  skipped: %s  errors: %s  slots: %s  unknown: %s  "
+        "areas: %s  cities: %s  days: %s  error_rows: %s  data_version: %s  pruned: %s slot(s), "
+        "%s byte(s)",
+        day, summary["images"], summary["measured"], summary["skipped"], summary["errors"],
+        summary["slots"], len(summary["unknown"]), summary["areas"], summary["cities"],
+        summary["days"], published["error_rows"], published["data_version"],
+        pruned["slots"], pruned["bytes"],
+    )
+    return summary
+
+
+def run_maintenance_job(raw_root, now=None, dump_dir=None) -> dict | None:
+    """The 03:30 job: dump, prune raw PNGs, VACUUM, and record the slot health summary.
+
+    Returns None when another run holds the maintenance lock. `now` is injectable so the job is
+    testable without a wall-clock dependency (the same rule the capture jobs follow), and
+    `dump_dir` mirrors `run_night_job`'s `out_dir` so a caller can point the `pg_dump` at a temp
+    directory instead of the `/data/dump` default. The run's alerts go through
+    `maintenance.run_maintenance`'s default notifier (`alerts.notify`): the scheduled path is a
+    caller of the module, so the channel is injected there, not wired here (R24).
+    """
+    try:
+        with connect() as conn:
+            return maintenance.run_maintenance(conn, raw_root, now=now, dump_dir=dump_dir)
+    except JobLocked:
+        logging.info("maintenance is already running elsewhere; skipping")
+        return None
+
+
+def build(raw_root, *, out_dir=None, capturer=None, now=None):
+    """The 14-job scheduler. Everything after `raw_root` is keyword-only: `out_dir` used to sit in
+    the second positional slot, so a future `build(root, my_capturer)` would have bound a callable
+    as a path and failed much later inside the night job.
+    """
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 
@@ -80,4 +147,29 @@ def build(raw_root, capturer=None, now=None):
             coalesce=True,
             misfire_grace_time=600,
         )
+    # The night pass, half an hour after the 22:00 slot's two-hour window closes, then maintenance
+    # once the night job has had time to finish (it is the only thing reading the raw root). Both
+    # get an hour of misfire grace — unlike a capture slot, which is a hard 2 h window, a night run
+    # that a restart delayed is still worth running late. coalesce=True means a restart that missed
+    # several fires runs the job once, not once per missed fire.
+    scheduler.add_job(
+        run_night_job,
+        trigger=CronTrigger(hour=0, minute=30, timezone=SLOT_TZ),
+        args=[raw_root],
+        kwargs={"out_dir": out_dir, "now": now},
+        id="night",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        run_maintenance_job,
+        trigger=CronTrigger(hour=3, minute=30, timezone=SLOT_TZ),
+        args=[raw_root],
+        kwargs={"now": now},
+        id="maintenance",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
     return scheduler
