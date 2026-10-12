@@ -8,8 +8,9 @@ a block says otherwise; every verification step states the output it expects.
 The deploy is one Coolify **Docker Compose resource** named `traffic-index`
 (`deploy/compose.prod.yml`) with **three** containers — `db`, `worker`, `web` — one shared
 data volume, and no published ports. The images are **built and pushed from the dev box**,
-never built on the VPS: image A carries a baked Chromium, and neither directory here is a
-clone of the deployable app repo. Coolify only pulls and runs.
+never built on the VPS: image A carries a baked Chromium, and the frontend app directory is a
+repository of its own — Lovable-synced, not a clone of this one (§3) — which is why a raw
+`docker build` of it is never run. Coolify only pulls and runs.
 
 ---
 
@@ -18,7 +19,7 @@ clone of the deployable app repo. Coolify only pulls and runs.
 | Container | Image | Role | Restart | Ports |
 |---|---|---|---|---|
 | `db` | `postgres:16-alpine` | the database (`measurements`, the rollups, `slots`, `captures`, `job_runs`, `zones`) | `always` | none — `pg_isready` healthcheck only |
-| `worker` | `TRAFFIC_WORKER_IMAGE` (image A) | capture + `night` + `maintenance`; runs the scheduler | `always` | none |
+| `worker` | `TRAFFIC_WORKER_IMAGE` (image A) | capture + `night` + `maintenance`; runs the scheduler | `always` | none; **no `HEALTHCHECK`** — `ps` shows `running`, never `healthy` |
 | `web` | `TRAFFIC_WEB_IMAGE` (image B) | the public site (Nitro node-server on `3000`) | `always` | none — Coolify/Traefik terminates TLS and routes the domain here; the image also carries its own in-container `HEALTHCHECK` (`GET /en`) |
 
 There are **no published ports on any service**: the public site reaches `web` through
@@ -49,7 +50,7 @@ jobs run sequentially on a single worker):
 
 | When (local) | Job |
 |---|---|
-| every even hour `00:00 … 22:00` | `capture` — one slot, all 95 coordinates |
+| every even hour `00:00 … 22:00` | `capture` — one slot: the **89** `publish = true` zones (`capture.load_zones` filters; the registry's other 6 are the quiet areas) |
 | `00:30` | `night` — close **yesterday**: measure → aggregate → validate → publish → prune |
 | `03:30` | `maintenance` — `pg_dump`, prune raw PNGs, `VACUUM`, health + disk report |
 
@@ -57,8 +58,9 @@ jobs run sequentially on a single worker):
 
 **Disk budget.** The two image layers on disk total about **5 GB** — image A is **~4.64 GB**
 (4,644,940,379 bytes; the Playwright base plus a baked Chromium, by design) and image B is
-**~331 MB** (331,022,154 bytes). The spec's data budget sits **on top** of that: the 48 h
-window of raw PNGs peaks around **2.4 GB** (≈1.19 GB/day × 2 days, 95 × 12 images/day), plus
+**~331 MB** (331,049,864 bytes). The spec's data budget sits **on top** of that: the 48 h
+window of raw PNGs peaks around **2.4 GB** (≈1.19 GB/day × 2 days; 12 slots × the 89 captured
+zones = **1,068 images a day**), plus
 Postgres (≈0.3 MB/day of `measurements`), the 14 nightly dumps, and container logs — roughly
 **7 GB steady and ~10 GB peak**. So the full footprint is about **12 GB steady / ~15 GB peak**.
 A **40 GB SSD** is comfortable, but watch it at the peak: with ~5 GB of images that never
@@ -104,7 +106,7 @@ Expected tail of each: `built ghcr.io/tak1edd1ne/traffic-worker:<tag>` /
     docker image inspect ghcr.io/tak1edd1ne/traffic-worker:"$tag" --format '{{.Id}} {{.Size}}'
     docker image inspect ghcr.io/tak1edd1ne/traffic-web:"$tag"    --format '{{.Id}} {{.Size}}'
 
-Expected: image A ≈ `4644940379` bytes, image B ≈ `331022154` bytes. Both scripts take
+Expected: image A ≈ `4644940379` bytes, image B ≈ `331049864` bytes. Both scripts take
 `--stage-only <dir>` to assemble and prove the build context in seconds **without** running
 the multi-GB `docker build` (it prints `staged N files in <dir>`) — useful when you only
 changed the Dockerfile or want to confirm no secrets are staged. The scripts refuse to build
@@ -194,9 +196,9 @@ Only the site's own domain should be reachable from the public internet.
 
 ## 6. First bring-up
 
-Everything here runs from the repo root, using the same compose file and the same env:
-
-    COMPOSE="docker compose -f deploy/compose.prod.yml --env-file <env>"
+Everything here runs from the repo root with the same compose file and the same env, so every
+command below is written out in full as
+`docker compose -f deploy/compose.prod.yml --env-file <env> …`.
 
 Substitute `<env>` with the Coolify env file path (or `deploy/.env` locally). On the VPS,
 Coolify's Terminal already has the env exported — `docker compose -f deploy/compose.prod.yml …`
@@ -247,23 +249,28 @@ Expected: `out/`, `raw/`, `dump/` each `drwxr-xr-x … root root` under `/data`.
 
     docker compose -f deploy/compose.prod.yml --env-file <env> run --rm worker \
       traffic-service doctor
-    # expected exactly:
+    # expected exactly, in this order:
     #   migrations: 4
     #   zones: 95
     #   published: 89
     #   published zones missing K: 0
+    #   last slot: <YYYY-MM-DD>T<HH>-00 <status>   <- printed only once a capture has run
+    #                                                (a fresh volume has no slots row yet)
     # exit 0 (a non-zero exit prints UNHEALTHY to stderr)
 
 `doctor` must print **95 / 89 / 0** — 95 zones seeded, 89 published, 0 published zones
-missing their capacity. That is the gate for "the registry is correct".
+missing their capacity — and, once any capture has run, the newest `slots` row as
+`last slot: <key> <status>`. That is the gate for "the registry is correct".
 
 ### Step 3 — start the whole stack
 
     docker compose -f deploy/compose.prod.yml --env-file <env> up -d --wait
     docker compose -f deploy/compose.prod.yml --env-file <env> ps
 
-Expected: three containers `running`/`healthy` (or `Exited` only for the one-shot runs
-above). Then confirm the site is up (**before any publish it looks empty on purpose**):
+Expected: `db` and `web` `running`/`healthy`, and `worker` `running` — `worker` declares no
+`HEALTHCHECK`, so `ps` never reports it as `healthy` (the one-shot `run --rm` containers from
+above show as `Exited`). Then confirm the site is up (**before any publish it looks empty on
+purpose**):
 
     docker compose -f deploy/compose.prod.yml --env-file <env> exec -T web \
       node -e "fetch('http://127.0.0.1:3000/en').then(r=>{console.log(r.status)})"
@@ -292,23 +299,55 @@ DB → frame → publish path on a **3-zone subset**, and the full path has neve
 published zones**. Run at least one real day end to end at the full registry:
 
 1. Let the scheduler capture a full day (or run the 12 slots by hand). A real slot with the
-   full registry is the capture-side proof:
+   full registry is the capture-side proof — the CLI prints its counts on **separate lines**,
+   and the zone count is **89** (the registry's `publish = true` set), never 95:
 
        docker compose -f deploy/compose.prod.yml --env-file <env> run --rm worker \
          traffic-service capture --slot now
-       # expected: "captured: 95  failed: 0  skipped: 0", status ok, exit 0
+       # expected, in this order (`slot` is the even-hour slot the clock is in; `dir` is that
+       # key under --raw-root):
+       #   slot: 2026-10-12T14-00
+       #   status: ok
+       #   captured: 89
+       #   failed: 0
+       #   skipped: 0
+       #   dir: /data/raw/2026-10-12T14-00
+       # exit 0 when the status is ok; any other status exits 1
 
 2. After the day closes, the `night` batch must publish. Confirm the day's twelve `slots`
    rows are complete first:
 
        docker compose -f deploy/compose.prod.yml --env-file <env> run --rm worker \
-         sh -c 'psql "$DATABASE_URL" -c "select count(*) as slot_rows, sum(captured) as captured, sum(expected) as expected from slots where slot_ts >= now() - interval \'1 day\'"'
-       # expected: slot_rows 12, captured/expected >= 0.95 (the publish gate)
+         sh -c 'psql "$DATABASE_URL" -c "select count(*) as slot_rows, sum(captured) as captured, sum(expected) as expected from slots where slot_ts >= now() - make_interval(days => 1)"'
+       # expected: slot_rows 12; captured/expected >= 0.95 (the publish gate)
+       # (make_interval(days => 1), not interval '1 day': a single quote inside the
+       #  single-quoted sh -c argument cannot be escaped, and this form needs none)
 
-3. Publish and inspect:
+3. **Verify the night from both routes.** The scheduled 00:30 job has no console of its own,
+   so `scheduler.run_night_job` logs the run's summary as **one line**; the `job_runs` row is
+   the audit record. Both, then the authoritative one:
 
-       docker compose -f deploy/compose.prod.yml --env-file <env> logs worker | grep -A6 '^day:'
-       # expected lines: "day: <D>", "images: …  measured: …  slots: 12", "data_version: <D>-<hash>"
+       # route 1 — the scheduled job's own line (`logs worker` holds the current container's
+       # output only, so a much older night can have rotated away):
+       docker compose -f deploy/compose.prod.yml --env-file <env> logs worker | grep -F 'night ' | tail -3
+       # expected, one line per night run — the same fields `night` prints, on one line:
+       #   2026-10-13 00:30:02,345 INFO traffic_service.scheduler: night 2026-10-12: images: 1068  measured: 1068  skipped: 0  errors: 0  slots: 12  unknown: 0  areas: 89  cities: 27  days: 1  error_rows: 0  data_version: 2026-10-12-<12 hex>  pruned: 12 slot(s), <N> byte(s)
+       # (a manual `traffic-service night --day <D> …` one-shot prints the same summary as
+       #  separate lines to *its own* stdout instead — §11's backfill row shows that run.)
+
+       # route 2 — AUTHORITATIVE: the night's row in the audit table:
+       docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
+         psql -U traffic -d traffic -c "select job, target, ok, finished_at from job_runs where job = 'night' order by id desc limit 1"
+       # expected (one row for the night the 00:30 job just ran):
+       #    job  |  target    | ok |        finished_at
+       #  -------+------------+----+------------------------
+       #   night | 2026-10-12 | t  | 2026-10-13 00:34:11.482+01
+
+   The **`job_runs` row is authoritative**: it is the record `alerts.health` reads, it
+   survives a container recreate, and `ok`/`finished_at` are what an operator is asking
+   about. The log line is that same run's detail (the counts and the `data_version` the site
+   will serve) — same run, second witness. `exec -T db psql -U traffic -d traffic` is the
+   §9 shape; substitute `POSTGRES_USER`/`POSTGRES_DB` if you changed them.
 
    The published **national index must land inside the 0.5–40 band** the historical range
    accepts:
@@ -341,15 +380,61 @@ the publish → serve contract proven end to end.
 ### 7c. One deliberately killed capture slot produces an alert
 
 Simulate the one silent failure the project most cares about — a slot that never completed —
-so the alert path is proven. Stop the worker mid-slot (or run a slot and kill it), then run
-`maintenance` and confirm the health lens names it and the alert is delivered:
+so the alert path is proven. **First the ceiling on what this can show:** `alerts.health`
+looks at the trailing 24 h of even-hour slots **excluding the slot containing `now`**, so a
+slot you kill *right now* reports **nothing** until the clock crosses the next even boundary
+(up to ~2 h later). Route A below makes the alert reachable straight away; Route B does it
+without touching the DB but waits for that boundary. First, the honest immediate expectation:
 
-    # stop/kill the worker so a slot is left running or missing, then:
+    # kill the worker mid-slot, then run maintenance straight away:
+    docker compose -f deploy/compose.prod.yml --env-file <env> stop worker
     docker compose -f deploy/compose.prod.yml --env-file <env> run --rm worker \
       traffic-service maintenance
-    # expected (stderr): "warning: slot <ts> still running (stale) …" or
-    #                    "warning: no slot row for <ts> — the capture never ran"
-    # and, with ALERT_WEBHOOK_URL set, the same sentence on your phone/topic.
+    # expected: NO slot warning yet. The slot you just killed is the one `health` deliberately
+    # excludes (it may still be running); the next even hour moves it into the window, and the
+    # next `maintenance` run (03:30, or a manual one) reports it from then on:
+    #   warning: slot <key> still running (stale) — the worker died mid-slot
+    # `maintenance --day <D>` does NOT shorten this: `--day` names only the `job_runs` row and
+    # the dump file — `health` always reads the real clock. Re-running it sooner changes nothing.
+
+Both routes need a capture from the last 24 h, so run this after §7a.
+
+**Route A — deterministic, no wait.** Make a slot that is already ≥ 2 h old look like the one
+the worker died in. List the window, flip the newest slot in it to `running`, run
+`maintenance`, then put the status back:
+
+    # 1. the last 24 h of slots, newest first — what `health` will look at:
+    docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
+      psql -U traffic -d traffic -c "select slot_ts, status, captured, expected from slots where slot_ts >= now() - make_interval(hours => 24) order by slot_ts desc"
+
+    # 2. the newest slot that is at least 2 h old — exactly the first slot `health` inspects:
+    docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
+      psql -U traffic -d traffic -c "update slots set status = 'running' where slot_ts = (select max(slot_ts) from slots where slot_ts <= now() - make_interval(hours => 2))"
+
+    # 3. run maintenance and confirm the health lens names it and the channel delivers it:
+    docker compose -f deploy/compose.prod.yml --env-file <env> run --rm worker \
+      traffic-service maintenance
+    # expected (stderr, and on your topic/phone with ALERT_WEBHOOK_URL set):
+    #   warning: slot <key> still running (stale) — the worker died mid-slot
+
+    # 4. put the status back (the value step 1 printed for that row — `ok` after §7a's slot):
+    docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
+      psql -U traffic -d traffic -c "update slots set status = 'ok' where slot_ts = (select max(slot_ts) from slots where slot_ts <= now() - make_interval(hours => 2))"
+
+**Route B — no DB edit.** Leave the worker stopped: every even-hour slot that fires while it
+is down has no row at all, and the first one to fall ≥ 2 h behind the clock (the next even
+boundary, ≤ 2 h) is reported as
+
+    # with the worker still stopped, at or after the next even hour:
+    #   warning: no slot row for <key> — the capture never ran
+
+Then start the worker again (`docker compose … up -d worker`). A missed slot stays missed —
+this route simulates a **real** hole, not a status flag — so `no slot row for <key>` keeps
+firing for the next 24 h: fill that slot with
+`… run --rm worker traffic-service capture --slot <ts>` (§11's stuck-slot row) before the next
+`night`, or the day fails the twelve-slot publish gate. Route A leaves nothing behind once its
+step 4 has put the status back. Both warnings are exactly what §8's alert list names — a stale
+`running` slot, and a slot that never ran.
 
 ### 7d. (Local, disposable) the fixture smoke
 
@@ -401,16 +486,21 @@ The window is the trailing **24 h** of even-hour slots, **excluding** the slot c
 abort on the scheduled path does **not** call the webhook directly. The failure surfaces on
 the **03:30 `maintenance`** row: `alerts.health` reads the **last `night` `job_runs` row** and
 reports `night <target> failed: <error>`. So look at the **maintenance** health lens (and its
-webhook) for a failed scheduled night — not at the night job's own output.
+webhook) for a failed scheduled night — not at the night job's own output. One consequence for
+§7a: the one-line summary the scheduled job logs is logged **only by a run that reached its
+publish**, so a missing `night <day>:` line beside an `ok = false` `job_runs` row is an abort,
+not a lost log line — the traceback is in `logs worker` under the scheduler's own logger.
 
 ---
 
 ## 9. Backups and restore
 
-`maintenance` (03:30, and any manual run) writes a nightly `pg_dump` to `/data/dump` **first**,
-before any read that could fail, so a backup is never skipped by a later error. Retention is
-today's dump plus the **14** newest older ones (`keep=14` → up to 15 files). A failed
-`pg_dump` raises and the run's `job_runs` row reads `ok = false` with the reason.
+`maintenance` (03:30, and any manual run) runs **prune → dump → vacuum → health**: the nightly
+`pg_dump` into `/data/dump` is the second step, ahead of every read that could fail (the
+`VACUUM`, the slot-health query, the disk check), so the backup is never skipped by a later
+error. Retention is today's dump plus the **14** newest older ones (`keep=14` → up to 15
+files). A failed `pg_dump` raises and the run's `job_runs` row reads `ok = false` with the
+reason.
 
     docker compose -f deploy/compose.prod.yml --env-file <env> run --rm worker \
       sh -c 'ls -la /data/dump && gzip -t /data/dump/$(date +%F).sql.gz && echo "gzip OK"'
@@ -461,8 +551,10 @@ today's dump plus the **14** newest older ones (`keep=14` → up to 15 files). A
 3. **Redeploy** the resource. Coolify pulls the new image and recreates the container.
 
 The worker resumes from DB state: every job is **idempotent by unique key** — a re-run of a
-slot overwrites the same PNG and the same `captures` rows, and a `night` re-run of an
-already-published day reproduces the same content-addressed `data_version`. An interrupted
+slot overwrites the same PNG and re-upserts the same `captures` rows, the night's rollups are
+written `on conflict … do update`, and the night's own `slots` upsert is `on conflict … do
+nothing` (a real capture's counts are never clobbered by the night pass). A `night` re-run of
+an already-published day reproduces the same content-addressed `data_version`. An interrupted
 job simply re-runs on the next fire (the advisory locks make a duplicate a no-op, recorded
 `ok = true` with `metrics {"skipped": "locked"}`). No data migration step is needed between
 releases unless a migration file was added, in which case run `migrate` (§6 Step 2) after the

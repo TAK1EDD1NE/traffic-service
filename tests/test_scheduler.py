@@ -86,23 +86,36 @@ def test_build_takes_out_dir_by_keyword_only():
         build("unused", lambda *args, **kwargs: None)
 
 
-def test_the_night_job_closes_the_local_day_before_now(db, tmp_path, monkeypatch):
-    """00:30 closes **yesterday** on the Algiers clock and hands the run to `night.run_day`."""
+def test_the_night_job_closes_the_local_day_before_now(db, tmp_path, monkeypatch, caplog):
+    """00:30 closes **yesterday** on the Algiers clock, hands the run to `night.run_day`, and
+    logs the returned summary as the one line `docker compose logs worker` shows."""
+    import logging
+
     from traffic_service import night, scheduler
 
     captured = {}
+    summary = {"images": 1068, "measured": 1068, "skipped": 0, "errors": 0, "slots": 12,
+               "unknown": [], "areas": 89, "cities": 27, "days": 1,
+               "publish": {"data_version": "2026-10-04-abcdef123456", "error_rows": 0},
+               "prune": {"slots": 12, "bytes": 99}}
 
     def fake_run_day(conn, day, raw_root, out_dir, **kwargs):
         captured.update(day=day, raw_root=raw_root, out_dir=out_dir, now=kwargs.get("now"))
-        return {"ok": True}
+        return summary
 
     monkeypatch.setattr(night, "run_day", fake_run_day)
-    result = scheduler.run_night_job(tmp_path, out_dir=tmp_path / "out",
-                                     now=datetime(2026, 10, 5, 0, 30, tzinfo=ALGIERS))
+    with caplog.at_level(logging.INFO):
+        result = scheduler.run_night_job(tmp_path, out_dir=tmp_path / "out",
+                                         now=datetime(2026, 10, 5, 0, 30, tzinfo=ALGIERS))
 
-    assert result == {"ok": True}
+    assert result is summary
     assert captured["day"] == date(2026, 10, 4), "00:30 on the 5th closes the 4th"
     assert captured["out_dir"] == tmp_path / "out"
+    line = next(m for m in (r.getMessage() for r in caplog.records)
+                if m.startswith("night 2026-10-04:"))
+    assert line == ("night 2026-10-04: images: 1068  measured: 1068  skipped: 0  errors: 0  "
+                    "slots: 12  unknown: 0  areas: 89  cities: 27  days: 1  error_rows: 0  "
+                    "data_version: 2026-10-04-abcdef123456  pruned: 12 slot(s), 99 byte(s)")
 
 
 def test_the_maintenance_job_records_a_run_and_exits(db, tmp_path, monkeypatch):

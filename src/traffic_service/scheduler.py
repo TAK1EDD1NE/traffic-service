@@ -72,16 +72,34 @@ def run_night_job(raw_root, out_dir=None, now=None, workers=DEFAULT_WORKERS) -> 
     The day is the **local** day before today in `SLOT_TZ` (`cli.resolve_day("yesterday")`'s rule):
     at 00:30 the day that just closed is the one to publish. Returns None when another run holds
     the day's advisory lock — the work is happening, just not here.
+
+    The scheduled path has no console of its own (unlike `cli.cmd_night`, which prints to an
+    operator's terminal), so the run's summary is logged as **one line**: the same counts, the
+    `data_version` and the prune outcome, so `docker compose logs worker` shows the night's
+    outcome. The `job_runs` row stays the audit record; a failed prune is additionally a WARNING
+    out of `night.run_day` itself.
     """
     moment = now or datetime.now(SLOT_TZ)
     day = (moment.astimezone(SLOT_TZ) - timedelta(days=1)).date()
     directory = pathlib.Path(out_dir) if out_dir is not None else DEFAULT_OUT_DIR
     try:
         with connect() as conn:
-            return night.run_day(conn, day, raw_root, directory, workers=workers, now=moment)
+            summary = night.run_day(conn, day, raw_root, directory, workers=workers, now=moment)
     except JobLocked:
         logging.info("night %s is already running elsewhere; skipping", day)
         return None
+    published = summary["publish"]
+    pruned = summary["prune"]
+    logging.info(
+        "night %s: images: %s  measured: %s  skipped: %s  errors: %s  slots: %s  unknown: %s  "
+        "areas: %s  cities: %s  days: %s  error_rows: %s  data_version: %s  pruned: %s slot(s), "
+        "%s byte(s)",
+        day, summary["images"], summary["measured"], summary["skipped"], summary["errors"],
+        summary["slots"], len(summary["unknown"]), summary["areas"], summary["cities"],
+        summary["days"], published["error_rows"], published["data_version"],
+        pruned["slots"], pruned["bytes"],
+    )
+    return summary
 
 
 def run_maintenance_job(raw_root, now=None, dump_dir=None) -> dict | None:
