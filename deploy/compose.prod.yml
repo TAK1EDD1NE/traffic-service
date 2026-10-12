@@ -3,8 +3,10 @@
 # (spec:59-89, 224-233).
 #
 # Images are built and pushed from the dev box (deploy/build-worker.sh,
-# deploy/build-web.sh) because image A carries a baked Chromium and neither
-# directory is a clone of the deployable repo. Coolify only pulls.
+# deploy/build-web.sh) because image A carries a baked Chromium. Neither
+# directory is a clone of the deployable repo: webapp/lovable-app is its own
+# Lovable-synced repository (§3) and `data engineering/` is tracked by nothing.
+# Coolify only pulls.
 name: traffic-index
 
 services:

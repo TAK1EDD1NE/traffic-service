@@ -328,8 +328,9 @@ published zones**. Run at least one real day end to end at the full registry:
    the audit record. Both, then the authoritative one:
 
        # route 1 — the scheduled job's own line (`logs worker` holds the current container's
-       # output only, so a much older night can have rotated away):
-       docker compose -f deploy/compose.prod.yml --env-file <env> logs worker | grep -F 'night ' | tail -3
+       # output only, so a much older night can have rotated away). The `: `-anchored pattern keeps a
+       # `night <day> is already running elsewhere; skipping` skip line out of the output:
+       docker compose -f deploy/compose.prod.yml --env-file <env> logs worker | grep -E 'night [0-9]{4}-[0-9]{2}-[0-9]{2}: ' | tail -3
        # expected, one line per night run — the same fields `night` prints, on one line:
        #   2026-10-13 00:30:02,345 INFO traffic_service.scheduler: night 2026-10-12: images: 1068  measured: 1068  skipped: 0  errors: 0  slots: 12  unknown: 0  areas: 89  cities: 27  days: 1  error_rows: 0  data_version: 2026-10-12-<12 hex>  pruned: 12 slot(s), <N> byte(s)
        # (a manual `traffic-service night --day <D> …` one-shot prints the same summary as
@@ -341,7 +342,7 @@ published zones**. Run at least one real day end to end at the full registry:
        # expected (one row for the night the 00:30 job just ran):
        #    job  |  target    | ok |        finished_at
        #  -------+------------+----+------------------------
-       #   night | 2026-10-12 | t  | 2026-10-13 00:34:11.482+01
+       #   night | 2026-10-12 | t  | 2026-10-13 00:34:11.482+00
 
    The **`job_runs` row is authoritative**: it is the record `alerts.health` reads, it
    survives a container recreate, and `ok`/`finished_at` are what an operator is asking
@@ -407,9 +408,14 @@ the worker died in. List the window, flip the newest slot in it to `running`, ru
     docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
       psql -U traffic -d traffic -c "select slot_ts, status, captured, expected from slots where slot_ts >= now() - make_interval(hours => 24) order by slot_ts desc"
 
-    # 2. the newest slot that is at least 2 h old — exactly the first slot `health` inspects:
+    # 2. the newest slot that is at least 2 h old — exactly the first slot `health` inspects.
+    #    Print it once, then flip THAT literal timestamp to `running`:
     docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
-      psql -U traffic -d traffic -c "update slots set status = 'running' where slot_ts = (select max(slot_ts) from slots where slot_ts <= now() - make_interval(hours => 2))"
+      psql -U traffic -d traffic -c "select max(slot_ts) as slot_ts from slots where slot_ts <= now() - make_interval(hours => 2)"
+    # expected: one timestamp — note it as <slot_ts> and use it here and in step 4:
+    #   2026-10-12 12:00:00+00
+    docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
+      psql -U traffic -d traffic -c "update slots set status = 'running' where slot_ts = '<slot_ts>'"
 
     # 3. run maintenance and confirm the health lens names it and the channel delivers it:
     docker compose -f deploy/compose.prod.yml --env-file <env> run --rm worker \
@@ -417,9 +423,12 @@ the worker died in. List the window, flip the newest slot in it to `running`, ru
     # expected (stderr, and on your topic/phone with ALERT_WEBHOOK_URL set):
     #   warning: slot <key> still running (stale) — the worker died mid-slot
 
-    # 4. put the status back (the value step 1 printed for that row — `ok` after §7a's slot):
+    # 4. put the status back — the EXACT timestamp step 2 flipped, and the value step 1 printed for
+    #    that row (`ok` after §7a's slot). Never a re-derived max(): if the clock crossed an
+    #    even-hour boundary between the steps, that would target a different slot and leave this one
+    #    stuck `running`:
     docker compose -f deploy/compose.prod.yml --env-file <env> exec -T db \
-      psql -U traffic -d traffic -c "update slots set status = 'ok' where slot_ts = (select max(slot_ts) from slots where slot_ts <= now() - make_interval(hours => 2))"
+      psql -U traffic -d traffic -c "update slots set status = 'ok' where slot_ts = '<slot_ts>'"
 
 **Route B — no DB edit.** Leave the worker stopped: every even-hour slot that fires while it
 is down has no row at all, and the first one to fall ≥ 2 h behind the clock (the next even

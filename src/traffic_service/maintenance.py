@@ -10,24 +10,25 @@ lives in `cli.cmd_maintenance`. That split is the seam plan 4 Task 1 grows into 
 
 Four jobs, in order:
 
-- **dump** (`dump.pg_dump`) — a nightly `pg_dump` to `/data/dump`, the file an operator restores
-  on a fresh VPS. **On by default**, and **first**: a maintenance run that silently skipped the
-  backup is the failure this pass exists to prevent, so no later read (a health query, the disk
-  check) may be able to cost it. Retention is today's dump plus the `keep` newest older ones —
-  `keep + 1` files, 15 at the default `keep=14` (see `dump.py`). A non-zero `pg_dump` raises
-  `DumpFailed` out of `run_maintenance`, so the `job_runs` row reads `ok = false` with the reason.
 - **prune** (`prune.prune_raw`) — the same retention rule the night job applies, run on its own so
   pixels are still cleaned up on a day whose publish aborted (the night job prunes only after a
   successful publish, which is correct for the publish path but leaves a failed day's pixels for
   the maintenance pass to age out).
+- **dump** (`dump.pg_dump`) — a nightly `pg_dump` to `/data/dump`, the file an operator restores
+  on a fresh VPS. **On by default**, and run ahead of every read that could raise (a health query,
+  the disk check): a maintenance run that silently skipped the backup is the failure this pass
+  exists to prevent, so no later read may be able to cost it. Retention is today's dump plus the
+  `keep` newest older ones — `keep + 1` files, 15 at the default `keep=14` (see `dump.py`). A
+  non-zero `pg_dump` raises `DumpFailed` out of `run_maintenance`, so the `job_runs` row reads
+  `ok = false` with the reason.
 - **vacuum** — `VACUUM (ANALYZE) measurements`, the table that grows every night. See the comment
   in `vacuum()`: VACUUM cannot run inside a transaction block, so it is issued on an autocommit
   connection.
 - **health** (`recent_slots` and `alerts.health`) — the last `HEALTH_WINDOW_DAYS` of slots as a
   per-slot summary, plus the alertable problems (`alerts.health` — a missing/stale/short slot, a
   failed night) and the disk check. An unhealthy-but-checked system is not a failed run: the
-  problems are recorded in `metrics` and sent to the notifier; only a failed `pg_dump` fails the
-  run.
+  problems are recorded in `metrics` and sent to the notifier; a failed `pg_dump` — or any other
+  step that raises — fails the run and is alerted.
 """
 from __future__ import annotations
 
@@ -172,6 +173,15 @@ def run_maintenance(conn, raw_root, *, now: datetime | None = None,
                 summary = {"prune": pruned, "vacuum": vacuumed, "slots": slots,
                            "problems": problems, "dump": dump_path}
                 record["metrics"] = summary
+    except Exception as error:
+        # TOTAL failure path: any exception that escapes a step (vacuum, the health/disk reads,
+        # `db.database_url()`, …) is recorded for the alert and then re-raised unchanged, so
+        # `job_run` still writes `ok = false` with the error text. Before this, only a
+        # `DumpFailed` reached the notifier and every other failure ended the run silently
+        # (spec:216-218). `DumpFailed` already set `failure` above with its own pinned message.
+        if failure is None:
+            failure = f"{type(error).__name__}: {error}"
+        raise
     finally:
         # After `job_run` wrote its row: a delivery problem must never corrupt the audit record.
         for message in [*problems, *([failure] if failure else [])]:

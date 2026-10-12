@@ -215,3 +215,60 @@ def test_the_dump_survives_a_missing_raw_root(db, tmp_path, monkeypatch):
     assert (job, ok) == ("maintenance", True)
     assert metrics["prune"] == {"slots": 0, "bytes": 0}
     assert metrics["problems"], "the empty window is still reported through slot health"
+
+
+def test_any_failing_step_alerts_not_just_the_dump(db, tmp_path, monkeypatch):
+    """The failure path is TOTAL (spec:216-218): a step that is not the dump raising must still
+    leave the audit row `ok = false` with the reason AND deliver the failure to the notifier.
+
+    The step forced to raise here is `alerts.health` (the health read, which runs after the dump).
+    Before the `except Exception` in `run_maintenance`, only a `DumpFailed` set a message, so this
+    run ended `ok = false` with `metrics` NULL and *no alert* — the exact silent-failure class the
+    pass exists to eliminate. The notifier is the injected spy, never `alerts.notify`.
+    """
+    sent = []
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    monkeypatch.setattr(dump.subprocess, "run", _recording_dump({}))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("health query exploded")
+
+    monkeypatch.setattr(maintenance.alerts, "health", boom)
+
+    with pytest.raises(RuntimeError, match="health query exploded"):
+        maintenance.run_maintenance(db, raw, dump_dir=tmp_path / "dump", notifier=sent.append)
+
+    with db.cursor() as cur:
+        cur.execute("select job, ok, metrics, error from job_runs order by id desc limit 1")
+        job, ok, metrics, error = cur.fetchone()
+    assert (job, ok) == ("maintenance", False)
+    assert metrics is None, "a failed run carries no metrics, by job_run's own rule"
+    assert "RuntimeError: health query exploded" in error, "the reason is on the audit row"
+    assert sent == ["RuntimeError: health query exploded"], \
+        "a non-dump failure reaches the notifier, not the void"
+
+
+def test_the_dump_is_written_before_a_read_that_raises(db, tmp_path, monkeypatch):
+    """Pin the ORDER itself: prune → dump → vacuum → health. A health read forced to raise must
+    leave the dump on disk, because the backup runs before every read that can fail.
+
+    `test_the_dump_survives_a_missing_raw_root` proves the outcome for a missing root but would
+    also pass with the OLD order whenever no read happens to raise; this test makes a read raise
+    and asserts the backup already landed — the order, not just the outcome.
+    """
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    dump_dir = tmp_path / "dump"
+    monkeypatch.setattr(dump.subprocess, "run", _recording_dump({}))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("read exploded")
+
+    monkeypatch.setattr(maintenance.alerts, "health", boom)
+
+    with pytest.raises(RuntimeError):
+        maintenance.run_maintenance(db, raw, dump_dir=dump_dir, notifier=lambda message: None)
+
+    assert list(dump_dir.glob("*.sql.gz")), \
+        "the backup precedes every read that can raise — it is on disk despite the health failure"
