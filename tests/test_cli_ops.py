@@ -25,6 +25,7 @@ import pytest
 
 from traffic_service import cli, dump, maintenance
 from traffic_service.db import connect
+from traffic_service.jobs import JobLocked
 from traffic_service.migrate import migrate
 from traffic_service.slots import SLOT_TZ, slot_for, slot_key, slot_label
 
@@ -272,3 +273,58 @@ def test_the_dump_is_written_before_a_read_that_raises(db, tmp_path, monkeypatch
 
     assert list(dump_dir.glob("*.sql.gz")), \
         "the backup precedes every read that can raise — it is on disk despite the health failure"
+
+
+def _hold(key: str):
+    """A second session holding `key`'s advisory lock, for the duration of the `with` block.
+
+    Same shape as `test_cli_night._hold`: the lock must be held on a DIFFERENT connection than
+    `db` — advisory locks are re-entrant within one session, so holding it on `db` itself would let
+    `run_maintenance` acquire it again and the test would pass vacuously.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def held():
+        with connect() as other:
+            with other.cursor() as cur:
+                cur.execute("select pg_try_advisory_lock(hashtext(%s))", (key,))
+                assert cur.fetchone()[0] is True
+            try:
+                yield
+            finally:
+                with other.cursor() as cur:
+                    cur.execute("select pg_advisory_unlock(hashtext(%s))", (key,))
+                other.commit()
+
+    return held()
+
+
+def test_a_lock_refused_maintenance_run_is_not_a_failure_and_sends_no_alert(db, tmp_path,
+                                                                           monkeypatch):
+    """A duplicate `maintenance` is not a failure and must not page the channel.
+
+    A second connection holds the `maintenance` lock — the benign overlap the lock exists for (a
+    manual run against the 03:30 scheduled one, which the scheduler logs as "already running
+    elsewhere; skipping"). `run_maintenance` must raise `JobLocked` unchanged and leave its audit
+    row `ok = true` with `metrics {"skipped": "locked"}`. `JobLocked` is a `RuntimeError`, so
+    without a guard ahead of the total `except Exception` it would be recorded as a failure and
+    alerted; the injected notifier spy here must stay empty (jobs.py:50-52, the module docstring,
+    and cli.py's `JobLocked` handling all pin this contract).
+    """
+    sent = []
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    monkeypatch.setattr(dump.subprocess, "run", _recording_dump({}))
+
+    with _hold("maintenance"):
+        with pytest.raises(JobLocked):
+            maintenance.run_maintenance(db, raw, dump_dir=tmp_path / "dump", notifier=sent.append)
+
+    with db.cursor() as cur:
+        cur.execute("select job, ok, metrics, error from job_runs order by id desc limit 1")
+        job, ok, metrics, error = cur.fetchone()
+    assert (job, ok) == ("maintenance", True)
+    assert metrics == {"skipped": "locked"}
+    assert error is None, "a lock-refused run is not a failure"
+    assert sent == [], "a duplicate maintenance must not alert — no page for a benign overlap"

@@ -36,7 +36,7 @@ import pathlib
 from datetime import date, datetime
 
 from traffic_service import alerts, db, dump, prune
-from traffic_service.jobs import advisory_lock, job_run
+from traffic_service.jobs import JobLocked, advisory_lock, job_run
 from traffic_service.slots import SLOT_TZ
 
 __all__ = ["DEFAULT_DUMP_DIR", "HEALTH_WINDOW_DAYS", "VACUUM_TABLE", "recent_slots",
@@ -173,6 +173,15 @@ def run_maintenance(conn, raw_root, *, now: datetime | None = None,
                 summary = {"prune": pruned, "vacuum": vacuumed, "slots": slots,
                            "problems": problems, "dump": dump_path}
                 record["metrics"] = summary
+    except JobLocked:
+        # A duplicate run, not a failure: another session holds the `maintenance` lock, so this
+        # pass did no work. `job_run` already left `ok = true` with `metrics {"skipped": "locked"}`
+        # (jobs.py:50-52), and the scheduler logs the same overlap as "already running elsewhere;
+        # skipping" (cli.py's `JobLocked` handling). `JobLocked` is a `RuntimeError`, so it must be
+        # re-raised HERE, ahead of the total handler below — otherwise a lock-refused run would be
+        # recorded as a failure and paged, alerting on the entirely benign cron overlap the lock
+        # exists for (the alert-fatigue failure this project's monitoring is built to avoid).
+        raise
     except Exception as error:
         # TOTAL failure path: any exception that escapes a step (vacuum, the health/disk reads,
         # `db.database_url()`, …) is recorded for the alert and then re-raised unchanged, so
