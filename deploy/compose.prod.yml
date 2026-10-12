@@ -1,0 +1,65 @@
+# The Coolify resource. Three containers, one shared volume, no published ports:
+# Traefik (Coolify) terminates TLS and routes to `web`, and nothing else is exposed
+# (spec:59-89, 224-233).
+#
+# Images are built and pushed from the dev box (deploy/build-worker.sh,
+# deploy/build-web.sh) because image A carries a baked Chromium and neither
+# directory is a clone of the deployable repo. Coolify only pulls.
+name: traffic-index
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-traffic}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-traffic}
+    volumes:
+      - traffic-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-traffic} -d ${POSTGRES_DB:-traffic}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: always
+
+  worker:
+    image: ${TRAFFIC_WORKER_IMAGE:-ghcr.io/tak1edd1ne/traffic-worker:latest}
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-traffic}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-traffic}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      TZ: Africa/Algiers
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+    volumes:
+      # The whole volume: /data/raw, /data/out and /data/dump all live under it.
+      - type: volume
+        source: traffic-data
+        target: /data
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  web:
+    image: ${TRAFFIC_WEB_IMAGE:-ghcr.io/tak1edd1ne/traffic-web:latest}
+    volumes:
+      # The volume's `out/` SUBPATH, never its root: with the root mounted here the
+      # site would see raw/, out/ and dump/ at its data root and serve nothing at
+      # /data/*.csv — and publishing into the volume root instead would expose
+      # /data/raw/<slot>/<png> and /data/dump/<day>.sql.gz (a downloadable database
+      # dump) on the public site. Long form so both services read the same way.
+      - type: volume
+        source: traffic-data
+        target: /app/.output/public/data
+        volume:
+          subpath: out
+    # No depends_on: the public site must stay up while the worker restarts, and the
+    # only thing the two share is the volume.
+    restart: always
+
+volumes:
+  traffic-pgdata:
+  traffic-data:
