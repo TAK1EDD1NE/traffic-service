@@ -20,11 +20,11 @@
 #
 #   --stage-only <dir>  Assemble the docker build context into <dir> (the app copy
 #                       with its exclusions, the nine zero-byte CSV placeholders,
-#                       the dotenv/CSV/node_modules assertions), print the staged
-#                       file count, and exit WITHOUT running `docker build`. This
-#                       makes the staging — the part that decides what a pushed
-#                       image can contain — provable in a second instead of a
-#                       multi-minute image build.
+#                       the runtime entrypoint, the dotenv/CSV/node_modules
+#                       assertions), print the staged file count, and exit WITHOUT
+#                       running `docker build`. This makes the staging — the part
+#                       that decides what a pushed image can contain — provable in
+#                       a second instead of a multi-minute image build.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -109,6 +109,12 @@ stage() {
   done
   : > "$dest/public/data/manifest.json"
 
+  # The runtime entrypoint (see web.Dockerfile) travels with the service repo in
+  # this directory. docker's COPY can only reach files inside the build context,
+  # and the context is this staged copy of the app — so the entrypoint is staged
+  # at the context root beside it. It is the one staged file that is not the app.
+  cp "$repo/deploy/web-entrypoint.sh" "$dest/web-entrypoint.sh"
+
   # The tar --exclude above is the PATTERN; this is the GUARANTEE. A pattern can
   # be narrowed by an anchor, a tar whose glob semantics differ, or a future edit —
   # and a single missed depth would bake a real credential into a pushed image.
@@ -140,6 +146,15 @@ stage() {
   if [ -n "$nm" ]; then
     echo "staged context contains node_modules (host tree must not enter the image):" >&2
     printf '%s\n' "$nm" >&2
+    exit 1
+  fi
+
+  # The entrypoint is the one file the Dockerfile COPYs from the context root. A
+  # missing or empty one would fail the image build late (or, worse, ship a
+  # no-op); refuse it here, in the second the stage takes.
+  if [ ! -s "$dest/web-entrypoint.sh" ]; then
+    echo "staged context is missing deploy/web-entrypoint.sh (the runtime entrypoint):" >&2
+    echo "  $dest/web-entrypoint.sh" >&2
     exit 1
   fi
 }
