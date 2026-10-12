@@ -8,7 +8,11 @@ Part of the live-index work described in
 ## Local development
 
     docker compose up -d --wait db        # Postgres 16 on localhost:5433
-    uv run --extra dev pytest             # tests need a database up
+    DATABASE_URL=postgresql://traffic@localhost:5432/traffic uv run --extra dev --extra pipeline pytest -q
+
+The suite needs **both** extras: `dev` carries pytest, `pipeline` carries pandas (a runtime
+import of `derive`/`night`/`publish`, so the worker image installs it too). Either point
+`DATABASE_URL` at the Docker database on 5433 (the default above) or at the native one on 5432.
 
 `DATABASE_URL` overrides the default `postgresql://traffic:traffic@localhost:5433/traffic`.
 Port 5433 is deliberate — 5432 is commonly taken on this machine (a native
@@ -103,8 +107,11 @@ slots** on even hours, the **night** pass at **00:30** (closing yesterday), and
 - `zone_id` is `<city_slug>_<area_no>` — the same string the scraper puts in PNG
   filenames, so a captured file maps to a zone with no lookup table.
 - **89 zones are published.** The other 6 (`Alger_14/15/16`, `Constantine_2/3`,
-  `Annaba_3`) are the excluded quiet areas: still captured, `publish = false`,
-  `capacity_k`/`floor_p20` NULL because they are absent from `traffic_areas.csv`.
+  `Annaba_3`) are the excluded quiet areas: **never captured** — `capture.load_zones` reads
+  only `publish = true`, so they have no PNGs and no `measurements` rows at all — and
+  `capacity_k`/`floor_p20` are NULL because they are absent from `traffic_areas.csv`. (The
+  spec's wording once implied they were captured but unpublished; the code is the registry
+  filter above, and the spec-vs-code question is open with the owner.)
 - `capacity_k` (= `traffic_areas.capacity_m`, the p99 observed metres) and
   `floor_p20` (= `traffic_areas.freeflow`) are **read from the corpus, never
   re-derived here**, and stamped with `floor_version`. Re-seeding with a different

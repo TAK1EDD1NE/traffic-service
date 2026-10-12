@@ -45,7 +45,7 @@ def _summary(**overrides):
 
 def _publish_result():
     return {"data_version": "2026-10-04-abc123def456", "day": DAY,
-            "counts": {"cities.csv": 1}, "csvs": ["cities.csv"]}
+            "counts": {"cities.csv": 1}, "csvs": ["cities.csv"], "error_rows": 0}
 
 
 def _an_old_slot_dir(raw_root, days=3):
@@ -99,6 +99,7 @@ def test_a_successful_night_commits_its_job_run_row_with_the_publish_and_prune_o
     assert code == 0
     out = capsys.readouterr().out
     assert "data_version: 2026-10-04-abc123def456" in out
+    assert "error_rows: 0" in out, "the day's errored-row count is part of the run's report"
     assert "pruned: 1 slot(s), 3 byte(s)" in out
     assert not pruned.exists(), "the prune runs only after a successful publish"
     with db.cursor() as cur:

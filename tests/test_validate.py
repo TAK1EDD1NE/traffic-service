@@ -172,7 +172,7 @@ def test_day_summary_with_no_slots_rows_reports_zero_and_no_index(db):
     summary = validate.day_summary(db, DAY)
 
     assert summary == {"slots_present": 0, "capture_ratio": 0.0,
-                       "zero_coverage_zones": [], "national_ci": None}
+                       "zero_coverage_zones": [], "error_rows": 0, "national_ci": None}
 
 
 def test_day_summary_names_zones_whose_day_total_observed_is_zero(db):
@@ -193,3 +193,50 @@ def test_day_summary_names_zones_whose_day_total_observed_is_zero(db):
     summary = validate.day_summary(db, DAY)
 
     assert summary["zero_coverage_zones"] == ["Alger_2"]
+
+
+# ---------- error_rows: reported, and never a gate of its own ----------
+
+def test_day_summary_counts_the_days_errored_measurement_rows(db):
+    """The pipeline turns an image it cannot decode into a row (not an exception), with every
+    colour metre 0; those rows are dropped by the derived frames, so the count is how many the
+    day lost. It is day-wide, whatever the row's other columns say."""
+    _slots(db)
+    for slot_ts in _slot_times():
+        _measure(db, "Alger_1", slot_ts, metres=6.0)
+    with db.cursor() as cur:
+        cur.execute("update measurements set error = 'cannot decode image' "
+                    "where zone_id = 'Alger_1' and slot_ts = %s", (_slot_times()[3],))
+    db.commit()
+
+    assert validate.day_summary(db, DAY)["error_rows"] == 1
+
+
+def test_an_all_errored_zone_still_trips_zero_coverage(db):
+    """The frame filter must not weaken the zero-coverage rule: that rule reads `measurements`
+    directly, so a zone whose whole day came back with zero metres — every row errored — is
+    still named and still fails the day (R16a)."""
+    _slots(db)
+    for slot_ts in _slot_times():
+        _measure(db, "Alger_1", slot_ts, metres=6.0)
+        _measure(db, "Alger_2", slot_ts, metres=0.0)
+    with db.cursor() as cur:
+        cur.execute("update measurements set error = 'cannot decode image' "
+                    "where zone_id = 'Alger_2'")
+    db.commit()
+
+    summary = validate.day_summary(db, DAY)
+
+    assert summary["zero_coverage_zones"] == ["Alger_2"]
+    assert summary["error_rows"] == 12
+    ok, reasons = validate.check_day(summary, historical=(0.5, 40.0), **RULES)
+    assert not ok and any("zero" in r for r in reasons)
+
+
+def test_check_day_ignores_the_error_rows_count():
+    """`error_rows` rides the summary and the night report but is NOT a rule: an errored slot is
+    excluded from the derivation, so one unreadable PNG must not cost the day's index — the
+    day-level gate stays the capture ratio (R16's ruling)."""
+    day = {"slots_present": 12, "capture_ratio": 0.99, "zero_coverage_zones": [],
+           "error_rows": 3, "national_ci": 8.0}
+    assert validate.check_day(day, historical=(0.5, 40.0), **RULES) == (True, [])

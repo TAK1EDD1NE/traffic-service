@@ -95,6 +95,11 @@ on conflict (zone_id, slot_ts) do update set processed_at = now(),
 # minus the four leading keys, which come from the zone and the slot's local clock.
 _CLEAN_METRICS = derive.CLEAN_COLUMNS[4:]
 
+# An errored row is one whose pixels could not be read: every colour metre is 0, so its
+# `congestion_index` is meaningless and would enter its area's plain daily mean as a false calm
+# (one errored slot of twelve is roughly -8% on that area-day — the same delta a colour-class
+# bug would produce). It is filtered here; `validate.day_summary` reports the count instead of
+# letting the row speak for the day.
 SELECT_CLEAN = f"""
 select z.city,
        z.area_no as area,
@@ -104,6 +109,7 @@ select z.city,
 from measurements m
 join zones z using (zone_id)
 where (m.slot_ts at time zone %s)::date = %s
+  and coalesce(m.error, '') = ''
 order by z.city, z.area_no, m.slot_ts
 """
 

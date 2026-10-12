@@ -60,6 +60,21 @@ def test_the_scheduler_has_the_12_capture_jobs_plus_the_night_and_maintenance_jo
             scheduler.shutdown(wait=False)
 
 
+def test_build_takes_out_dir_by_keyword_only():
+    """`out_dir` must not sit in the second positional slot: a future `build(root, my_capturer)`
+    would otherwise bind a callable as a path and fail much later inside the night job. The
+    keyword form still carries the path through to the job."""
+    scheduler = build(raw_root="unused", out_dir="/data/out")
+    try:
+        assert scheduler.get_job("night").kwargs["out_dir"] == "/data/out"
+    finally:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+
+    with pytest.raises(TypeError):
+        build("unused", lambda *args, **kwargs: None)
+
+
 def test_the_night_job_closes_the_local_day_before_now(db, tmp_path, monkeypatch):
     """00:30 closes **yesterday** on the Algiers clock and hands the run to `night.run_day`."""
     from traffic_service import night, scheduler

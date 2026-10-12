@@ -981,11 +981,11 @@ browser = [
     { name = "playwright" },
 ]
 dev = [
-    { name = "pandas" },
     { name = "pytest" },
 ]
 pipeline = [
     { name = "opencv-python" },
+    { name = "pandas" },
     { name = "scikit-image" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -996,7 +996,7 @@ pipeline = [
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10,<4" },
     { name = "opencv-python", marker = "extra == 'pipeline'", specifier = ">=4.10" },
-    { name = "pandas", marker = "extra == 'dev'", specifier = ">=2.2" },
+    { name = "pandas", marker = "extra == 'pipeline'", specifier = ">=2.2" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.54" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

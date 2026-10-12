@@ -2,7 +2,7 @@
 """Whether a closed day may reach the site.
 
 Two halves, deliberately split. `day_summary` is the only part that talks to the database — it
-reads back the four numbers a publish decision needs. `check_day` is pure, so the rules can be
+reads back the numbers a publish decision needs. `check_day` is pure, so the rules can be
 reviewed and tested without a day's worth of fixtures. `check_day` returns `(ok, reasons)` and
 never raises: a bad day is data the caller reports (the `night` command writes it to `job_runs`
 and raises the alarm — Task 6), not an exception to swallow somewhere up-stack.
@@ -73,6 +73,19 @@ order by z.zone_id
 
 SELECT_NATIONAL = "select national_ci from index_daily where day = %s"
 
+# The day's errored measurement rows: the pipeline turns an image it could not decode into a row
+# (not an exception) and its colour metres are all 0. The derived frames drop those rows
+# (`night.SELECT_CLEAN`, `publish.SELECT_HISTORY`), so this count is how many the day lost. It is
+# REPORTED, never a rule: one unreadable PNG must not cost the day's index (the day-level gate
+# stays the capture ratio), and the zone-level `zero_coverage_zones` rule still catches a zone
+# that was all-errored, because that rule reads `measurements` directly.
+SELECT_ERROR_ROWS = """
+select count(*)
+from measurements m
+where (m.slot_ts at time zone %s)::date = %s
+  and coalesce(m.error, '') <> ''
+"""
+
 
 def check_day(day, historical, slots_required, min_capture_ratio):
     """Judge a day summary; returns `(ok, reasons)` and never raises.
@@ -106,13 +119,14 @@ def check_day(day, historical, slots_required, min_capture_ratio):
 
 
 def day_summary(conn, day) -> dict:
-    """The four numbers `check_day` consumes, read back from the database for one local day.
+    """The numbers a publish decision needs, read back from the database for one local day.
 
     `slots_present` counts how many of the day's twelve expected slot timestamps have a `slots`
     row; `capture_ratio` is `sum(captured)/sum(expected)` over exactly those rows (`0.0` when
     there are none); `zero_coverage_zones` are the zones measured that day whose day-total
-    observed metres are zero; `national_ci` is the day's `index_daily` value, or `None` when the
-    day has no aggregates.
+    observed metres are zero; `error_rows` is the day-wide count of measurement rows whose error
+    text is non-empty (the rows the derived frames drop — reported, and deliberately not a rule);
+    `national_ci` is the day's `index_daily` value, or `None` when the day has no aggregates.
     """
     moments = [datetime(day.year, day.month, day.day, hour, tzinfo=SLOT_TZ).astimezone(timezone.utc)
                for hour in SLOT_HOURS]
@@ -121,6 +135,8 @@ def day_summary(conn, day) -> dict:
         present, captured, expected = cur.fetchone()
         cur.execute(SELECT_ZERO_COVERAGE, (str(SLOT_TZ), day))
         zero = [row[0] for row in cur.fetchall()]
+        cur.execute(SELECT_ERROR_ROWS, (str(SLOT_TZ), day))
+        error_rows = cur.fetchone()[0]
         cur.execute(SELECT_NATIONAL, (day,))
         national = cur.fetchone()
 
@@ -128,5 +144,6 @@ def day_summary(conn, day) -> dict:
         "slots_present": int(present),
         "capture_ratio": (float(captured) / float(expected)) if expected else 0.0,
         "zero_coverage_zones": zero,
+        "error_rows": int(error_rows),
         "national_ci": None if national is None else float(national[0]),
     }

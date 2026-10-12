@@ -10,8 +10,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 from traffic_service import pipeline
 
-# The 26 columns the `measurements` table promotes, in the migration's own order. The pipeline's
-# remaining eight (`filename`, `timestamp_processed`, the four `{c}_px` and four `{c}_pct`) are
+# The 24 columns the `measurements` table promotes, in the migration's own order. The pipeline's
+# remaining ten (`filename`, `timestamp_processed`, the four `{c}_px` and four `{c}_pct`) are
 # not promoted: the first two are job bookkeeping, and the last eight are pure functions of the
 # promoted columns, so they stay recoverable from `payload` (see the migration comment).
 MEASUREMENT_COLUMNS = (

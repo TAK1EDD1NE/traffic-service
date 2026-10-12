@@ -195,6 +195,10 @@ def cmd_night(args) -> int:
           f"skipped: {summary['skipped']}  errors: {summary['errors']}  "
           f"slots: {summary['slots']}  unknown: {len(summary['unknown'])}")
     print(f"areas: {summary['areas']}  cities: {summary['cities']}  days: {summary['days']}")
+    # The day's errored measurement rows, from the validation summary: the readable slots still
+    # publish, and this is how many rows the derivation dropped for that day (day-wide, so a
+    # re-run reports the same number as the run that wrote them).
+    print(f"error_rows: {published['error_rows']}")
     print(f"data_version: {published['data_version']}")
     print(f"pruned: {pruned['slots']} slot(s), {pruned['bytes']} byte(s)")
     if "error" in pruned:

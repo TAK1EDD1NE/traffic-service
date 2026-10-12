@@ -84,7 +84,9 @@ _V2_FILES = (("clean", "traffic_clean.csv"), ("rows", "traffic_rows.csv"),
 _HISTORY_METRICS = derive.CLEAN_COLUMNS[4:]
 
 # `night.clean_frame`'s read without the day filter: the whole history, on the same local clock
-# and in the corpus's text formats (`YYYY-MM-DD`, `HH:00`).
+# and in the corpus's text formats (`YYYY-MM-DD`, `HH:00`). Errored rows are excluded here too:
+# a row whose pixels could not be read (all colour metres 0, so a meaningless index) must not
+# contribute a false calm to the series the site is rebuilt from.
 SELECT_HISTORY = f"""
 select z.city,
        z.area_no as area,
@@ -93,14 +95,18 @@ select z.city,
        {", ".join(f"m.{column}" for column in _HISTORY_METRICS)}
 from measurements m
 join zones z using (zone_id)
+where coalesce(m.error, '') = ''
 order by z.city, z.area_no, m.slot_ts
 """
 
 
 class PublishAborted(RuntimeError):
     """The day was not published: validation failed, the shipping contract is not met, or the
-    generator left the set incomplete. Nothing was moved into `out_dir` and no manifest was
-    written, so its previous contents still stand."""
+    generator left the set incomplete. No manifest is written, so nothing half-written is ever
+    served as fresh, and `out_dir` keeps the previous manifest. What is *not* guaranteed is that
+    no CSV moved: the nine are moved only once the set is verified complete in the staging
+    directory, but that swap is one `os.replace` per file, so a failure part-way through it can
+    leave some of the nine already replaced (the next publish rewrites the whole set)."""
 
 
 def _assert_regenerator_supports_env(script_path: pathlib.Path) -> None:
@@ -200,7 +206,9 @@ def publish_day(db, day, out_dir, populations=None) -> dict:
     """Validate `day`, rebuild the whole series, and write the nine CSVs plus `manifest.json`.
 
     `populations` is a `city,population` CSV, defaulting to the committed
-    `data/cities_population.csv`. Returns `{data_version, day, counts, csvs}`; raises
+    `data/cities_population.csv`. Returns `{data_version, day, counts, csvs, error_rows}` — the
+    last is the day's errored-measurement count from the validation summary, carried so the
+    `night` report can show how many rows the clean frames dropped. Raises
     `PublishAborted` (writing no manifest) for a day that fails validation, a missing populations
     seed, unusable floors, an empty `measurements` history, a generator failure, or a set the
     generator left incomplete.
@@ -265,4 +273,4 @@ def publish_day(db, day, out_dir, populations=None) -> dict:
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return {"data_version": data_version, "day": day, "counts": counts,
-            "csvs": sorted(CSV_NAMES)}
+            "csvs": sorted(CSV_NAMES), "error_rows": summary["error_rows"]}

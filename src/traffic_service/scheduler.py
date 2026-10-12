@@ -98,7 +98,11 @@ def run_maintenance_job(raw_root, now=None) -> dict | None:
         return None
 
 
-def build(raw_root, out_dir=None, capturer=None, now=None):
+def build(raw_root, *, out_dir=None, capturer=None, now=None):
+    """The 14-job scheduler. Everything after `raw_root` is keyword-only: `out_dir` used to sit in
+    the second positional slot, so a future `build(root, my_capturer)` would have bound a callable
+    as a path and failed much later inside the night job.
+    """
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 

@@ -209,6 +209,79 @@ def test_clean_frame_is_the_clean_schema_on_the_days_local_clock(db, raw_root):
     assert sorted(set(frame["area"])) == [1, 2]
 
 
+# --- the errored-row filter: an unreadable image must not bias the day ---
+
+NEXT_DAY = dt.date(2026, 10, 5)
+PAIRS = [(hour, zone) for hour in (0, 2, 4) for zone in ("Alger_1", "Alger_2")]
+UNREADABLE = "Alger_1_2026-10-04_02-00.png"
+
+
+def _stage(root, day, pairs):
+    """A raw root holding exactly the `(hour, zone)` images `pairs`, in capture's layout."""
+    for hour, zone in pairs:
+        directory = root / f"{day}T{hour:02d}-00"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{zone}_{day}_{hour:02d}-00.png").write_bytes(b"png")
+    return root
+
+
+def _with_one_unreadable(path):
+    """`_row`, except one image failed to decode — every colour metre 0, exactly what the
+    pipeline promotes for an errored row, so its `congestion_index` is a meaningless calm."""
+    if pathlib.Path(path).name == UNREADABLE:
+        zeros = {f"{c}_{s}": 0.0 for c in ("green", "yellow", "red", "dark_red")
+                 for s in ("m", "mean_w", "highway_m", "normal_m")}
+        return _row(path, error="cannot decode image", congestion_index=0.0, **zeros)
+    return _row(path)
+
+
+def test_an_errored_measurement_row_is_excluded_from_both_clean_frame_reads(db, tmp_path):
+    """A row whose pixels could not be read carries zero metres and a meaningless index; if it
+    reached the derivation it would read as a calm slot and pull its area-day down. Both reads
+    drop it — the day's frame and the whole history `publish` rebuilds the site from."""
+    root = _stage(tmp_path / "raw", DAY, PAIRS)
+    night.measure_day(db, DAY, root, extractor=_with_one_unreadable)
+
+    frame = night.clean_frame(db, DAY)
+    history = publish._history_frame(db)
+
+    assert len(frame) == 5, "the day's readable rows, not its six images"
+    assert len(history) == 5
+    for read in (frame, history):
+        errored = ((read["date"] == "2026-10-04") & (read["time"] == "02:00")
+                   & (read["area"] == 1))
+        assert not errored.any(), "the errored row must not reach the derivation"
+
+
+def test_an_errored_row_does_not_bias_the_days_numbers(db, tmp_path):
+    """The point of the filter: the day's rollups equal those of the same day with that slot
+    simply absent. The comparison day has the identical five readable images and no errored one,
+    so every area, city and national value has to match — an unfiltered errored row would pull
+    area 1's mean down instead."""
+    errored = _stage(tmp_path / "errored", DAY, PAIRS)
+    absent = _stage(tmp_path / "absent", NEXT_DAY,
+                    [pair for pair in PAIRS if pair != (2, "Alger_1")])
+
+    night.run_night(db, DAY, errored, extractor=_with_one_unreadable)
+    night.run_night(db, NEXT_DAY, absent, extractor=_row)
+
+    def read(sql, day):
+        with db.cursor() as cur:
+            cur.execute(sql, (day,))
+            return cur.fetchall()
+
+    assert (read("select area, ci, coverage, n_rows from ci_area_daily where day = %s "
+                 "order by area", DAY)
+            == read("select area, ci, coverage, n_rows from ci_area_daily where day = %s "
+                    "order by area", NEXT_DAY))
+    assert (read("select city, ci, coverage, n_areas from ci_city_daily where day = %s", DAY)
+            == read("select city, ci, coverage, n_areas from ci_city_daily where day = %s",
+                    NEXT_DAY))
+    assert (read("select national_ci, n_cities, n_zones from index_daily where day = %s", DAY)
+            == read("select national_ci, n_cities, n_zones from index_daily where day = %s",
+                    NEXT_DAY))
+
+
 def test_aggregate_day_writes_the_days_numbers(db, raw_root):
     """The counts prove the wiring; these values prove the math that crossed the DB boundary.
 
@@ -241,7 +314,7 @@ _DAY_COUNTS = {"images": 6, "measured": 6, "skipped": 0, "errors": 0, "slots": 3
 
 def _publish_result():
     return {"data_version": "2026-10-04-abc123def456", "day": DAY,
-            "counts": {"cities.csv": 1}, "csvs": ["cities.csv"]}
+            "counts": {"cities.csv": 1}, "csvs": ["cities.csv"], "error_rows": 0}
 
 
 def test_run_day_is_refused_but_still_records_an_ok_skip_when_another_run_holds_the_day(
