@@ -27,7 +27,7 @@ MEASUREMENT_COLUMNS = (
 DEFAULT_WORKERS = 4
 
 
-def _project(row: dict) -> dict:
+def project(row: dict) -> dict:
     """Keep the promoted columns and normalise the error field to a plain string."""
     out = {k: row.get(k) for k in MEASUREMENT_COLUMNS}
     out["error"] = (row.get("error") or "").strip()
@@ -51,7 +51,7 @@ def measure_image(path) -> dict:
 
     Pure enough to run in a worker process.
     """
-    return _project(measure_image_full(path))
+    return project(measure_image_full(path))
 
 
 def real_extractor(path):
@@ -73,7 +73,7 @@ def _pin_threads() -> None:
 
 def _worker(path):
     _pin_threads()
-    return measure_image(path)
+    return measure_image_full(path)
 
 
 def measure_slot(paths, extractor=real_extractor, workers=DEFAULT_WORKERS) -> list[dict]:
